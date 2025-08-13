@@ -1,42 +1,22 @@
 #include "viewer.h"
+#include "vulkan_renderer.h"
 
 extern AppContext g_ctx;
 
-void DrawImage(HDC hdc, const RECT& clientRect, const AppContext& ctx) {
-    if (!ctx.hBitmap || IsRectEmpty(&clientRect)) return;
-
-    BITMAP bm;
-    GetObject(ctx.hBitmap, sizeof(BITMAP), &bm);
-    HDC memDC = CreateCompatibleDC(hdc);
-    SelectObject(memDC, ctx.hBitmap);
-
-    int srcWidth = bm.bmWidth;
-    int srcHeight = bm.bmHeight;
+void DrawImage(HDC /*hdc*/, const RECT& clientRect, const AppContext& ctx) {
     int clientWidth = clientRect.right - clientRect.left;
     int clientHeight = clientRect.bottom - clientRect.top;
+    if (clientWidth <= 0 || clientHeight <= 0) return;
 
-    SetGraphicsMode(hdc, GM_ADVANCED);
-    
-    double rad = ctx.rotationAngle * 3.1415926535 / 180.0;
-    float cosTheta = static_cast<float>(cos(rad));
-    float sinTheta = static_cast<float>(sin(rad));
-
-    XFORM xform;
-    xform.eM11 = cosTheta * ctx.zoomFactor;
-    xform.eM12 = sinTheta * ctx.zoomFactor;
-    xform.eM21 = -sinTheta * ctx.zoomFactor;
-    xform.eM22 = cosTheta * ctx.zoomFactor;
-    xform.eDx = static_cast<float>(clientWidth) / 2.0f + ctx.offsetX - (srcWidth / 2.0f * xform.eM11 + srcHeight / 2.0f * xform.eM21);
-    xform.eDy = static_cast<float>(clientHeight) / 2.0f + ctx.offsetY - (srcWidth / 2.0f * xform.eM12 + srcHeight / 2.0f * xform.eM22);
-
-    SetWorldTransform(hdc, &xform);
-
-    SetStretchBltMode(hdc, HALFTONE);
-    BitBlt(hdc, 0, 0, srcWidth, srcHeight, memDC, 0, 0, SRCCOPY);
-
-    ModifyWorldTransform(hdc, nullptr, MWT_IDENTITY);
-    SetGraphicsMode(hdc, GM_COMPATIBLE);
-    DeleteDC(memDC);
+    if (g_ctx.renderer) {
+        // Upload current bitmap to Vulkan texture (no-op if null)
+        if (ctx.hBitmap) {
+            g_ctx.renderer->UpdateImageFromHBITMAP(ctx.hBitmap);
+        }
+        // Render with current zoom/offset (rotation to be handled in a future shader-based pipeline)
+        g_ctx.renderer->Render(static_cast<uint32_t>(clientWidth), static_cast<uint32_t>(clientHeight),
+                               ctx.zoomFactor, ctx.offsetX, ctx.offsetY);
+    }
 }
 
 void FitImageToWindow() {

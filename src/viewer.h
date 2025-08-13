@@ -1,6 +1,5 @@
 #pragma once
 
-#define NOMINMAX
 #include <windows.h>
 #include <commdlg.h>
 #include <shlwapi.h>
@@ -12,19 +11,12 @@
 #include <string>
 #include <algorithm>
 #include <cmath>
+#include <memory>
 
 #include "ComPtr.h"
 #include "resource.h"
 
-#pragma comment(lib, "user32.lib")
-#pragma comment(lib, "gdi32.lib")
-#pragma comment(lib, "comdlg32.lib")
-#pragma comment(lib, "shlwapi.lib")
-#pragma comment(lib, "windowscodecs.lib")
-#pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "propsys.lib")
-#pragma comment(lib, "oleaut32.lib")
+class VulkanRenderer;
 
 struct AppContext {
     HINSTANCE hInst = nullptr;
@@ -42,11 +34,24 @@ struct AppContext {
 
     bool isFullScreen = false;
     LONG savedStyle = 0;
-    RECT savedRect = { 0 };
+    RECT savedRect{};
+
+    // Vulkan renderer (initialized after window creation)
+    std::unique_ptr<VulkanRenderer> renderer;
 
     bool showFilePath = false;
     std::wstring currentFilePathOverride;
     bool isHoveringClose = false;
+
+    // Declarations only; definitions are out-of-line where VulkanRenderer is complete
+    AppContext();
+    ~AppContext();
+
+    AppContext(const AppContext& other);
+    AppContext& operator=(const AppContext& other);
+
+    AppContext(AppContext&&) noexcept;
+    AppContext& operator=(AppContext&&) noexcept;
 };
 
 //

@@ -1,5 +1,6 @@
 #include "viewer.h"
 #include <winbase.h>
+#include "vulkan_renderer.h"
 
 AppContext g_ctx;
 
@@ -44,7 +45,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
         return 1;
     }
 
-    WNDCLASSEXW wcex = { sizeof(WNDCLASSEXW) };
+    WNDCLASSEXW wcex{};
+    wcex.cbSize = sizeof(WNDCLASSEXW);
     wcex.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
     wcex.lpfnWndProc = WndProc;
     wcex.hInstance = hInstance;
@@ -68,6 +70,13 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
     }
 
     SetWindowLongPtr(g_ctx.hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&g_ctx));
+
+    // Initialize Vulkan renderer
+    g_ctx.renderer = std::make_unique<VulkanRenderer>();
+    if (!g_ctx.renderer->Initialize(g_ctx.hWnd)) {
+        MessageBoxW(nullptr, L"Failed to initialize Vulkan renderer.", L"Error", MB_OK | MB_ICONERROR);
+        return 1;
+    }
 
     DragAcceptFiles(g_ctx.hWnd, TRUE);
 
