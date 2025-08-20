@@ -9,8 +9,7 @@ AppContext::~AppContext() = default;
 AppContext::AppContext(const AppContext& other)
     : hInst(other.hInst),
       hWnd(other.hWnd),
-      hBitmap(other.hBitmap),
-      wicFactory(other.wicFactory),
+      imageData(other.imageData),
       imageFiles(other.imageFiles),
       currentImageIndex(other.currentImageIndex),
       zoomFactor(other.zoomFactor),
@@ -21,16 +20,23 @@ AppContext::AppContext(const AppContext& other)
       savedStyle(other.savedStyle),
       savedRect(other.savedRect),
       renderer(nullptr),
+      ocioConfig(other.ocioConfig),
+      currentDisplayTransform(other.currentDisplayTransform),
+      displayDevice(other.displayDevice),
       showFilePath(other.showFilePath),
       currentFilePathOverride(other.currentFilePathOverride),
-      isHoveringClose(other.isHoveringClose) {}
+      isHoveringClose(other.isHoveringClose),
+      showFps(other.showFps),
+      fpsLastTimeMS(other.fpsLastTimeMS),
+      fpsFrameCount(other.fpsFrameCount),
+      fps(other.fps),
+      rendererNeedsReset(other.rendererNeedsReset) {}
 
 AppContext& AppContext::operator=(const AppContext& other) {
     if (this != &other) {
         hInst = other.hInst;
         hWnd = other.hWnd;
-        hBitmap = other.hBitmap;
-        wicFactory = other.wicFactory;
+        imageData = other.imageData;
         imageFiles = other.imageFiles;
         currentImageIndex = other.currentImageIndex;
         zoomFactor = other.zoomFactor;
@@ -42,9 +48,17 @@ AppContext& AppContext::operator=(const AppContext& other) {
         savedRect = other.savedRect;
         // renderer is not copied; ensure null
         renderer.reset();
+        ocioConfig = other.ocioConfig;
+        currentDisplayTransform = other.currentDisplayTransform;
+        displayDevice = other.displayDevice;
         showFilePath = other.showFilePath;
         currentFilePathOverride = other.currentFilePathOverride;
         isHoveringClose = other.isHoveringClose;
+        showFps = other.showFps;
+        fpsLastTimeMS = other.fpsLastTimeMS;
+        fpsFrameCount = other.fpsFrameCount;
+        fps = other.fps;
+        rendererNeedsReset = other.rendererNeedsReset;
     }
     return *this;
 }

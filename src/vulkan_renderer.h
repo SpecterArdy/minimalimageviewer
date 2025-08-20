@@ -1,82 +1,136 @@
 #pragma once
 
-#include <cstdint>
-#include <vector>
-#include <vulkan/vulkan.h>
 #ifdef _WIN32
-#include <vulkan/vulkan_win32.h>
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <vulkan/vulkan.h>
+#include <vulkan/vulkan_win32.h>
+#else
+#include <vulkan/vulkan.h>
 #endif
+
+#include <vector>
+#include <cstdint>
+
+// Structure for sparse image tile information
+struct TileInfo {
+    uint32_t x = 0;
+    uint32_t y = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool loaded = false;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+};
 
 class VulkanRenderer {
 public:
     VulkanRenderer();
     ~VulkanRenderer();
 
-#ifdef _WIN32
     bool Initialize(HWND hwnd);
-#endif
     void Shutdown();
-
-    // Render to the current swapchain. Will recreate swapchain if size changed.
-    void Render(uint32_t width, uint32_t height, float zoom, float offsetX, float offsetY);
-
-#ifdef _WIN32
-    // Resize swapchain on window size change
     void Resize(uint32_t width, uint32_t height);
-    // Upload BGRA8 pixels from an HBITMAP into an internal VkImage (recreates per size)
+    void Render(uint32_t width, uint32_t height, float zoom, float offsetX, float offsetY, int rotationAngle);
+
+    void UpdateImageFromData(const void* pixelData, uint32_t width, uint32_t height, bool isHdr);
     void UpdateImageFromHBITMAP(HBITMAP hBitmap);
-#endif
+    void UpdateImageFromLDRData(const void* pixelData, uint32_t width, uint32_t height, bool generateMipmaps = false);
+    void UpdateImageFromHDRData(const uint16_t* pixelData, uint32_t width, uint32_t height, bool generateMipmaps = false);
+    void UpdateImageTiled(const void* pixelData, uint32_t fullWidth, uint32_t fullHeight, 
+                         uint32_t tileX, uint32_t tileY, uint32_t tileWidth, uint32_t tileHeight, bool isHdr);
+
+    void SetColorTransform(void* processor);
+
+    // Error state accessors
+    bool IsDeviceLost() const { return deviceLost_; }
+    bool IsSwapchainOutOfDate() const { return swapchainOutOfDate_; }
 
 private:
-#ifdef _WIN32
-    bool initInstance();
-    bool pickPhysicalDevice();
-    bool createDeviceAndQueues();
-    bool createSurface(HWND hwnd);
-    bool createSwapchain(uint32_t width, uint32_t height);
-    void destroySwapchain();
-    bool createCommandPool();
-    bool createSyncObjects();
-    void recreateSwapchain(uint32_t width, uint32_t height);
-
-    uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
-    VkCommandBuffer beginSingleTimeCommands();
-    void endSingleTimeCommands(VkCommandBuffer cmd);
-
-    bool createTexture(uint32_t width, uint32_t height);
-    void destroyTexture();
-
-    // Vulkan core
+    // Vulkan objects
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
     VkQueue presentQueue_ = VK_NULL_HANDLE;
+
     uint32_t graphicsQueueFamily_ = UINT32_MAX;
     uint32_t presentQueueFamily_ = UINT32_MAX;
 
-    // Swapchain
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
-    VkFormat swapchainFormat_ = VK_FORMAT_B8G8R8A8_UNORM;
+    VkFormat swapchainFormat_ = VK_FORMAT_UNDEFINED;
     VkColorSpaceKHR swapchainColorSpace_ = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     VkExtent2D swapchainExtent_{};
     std::vector<VkImage> swapchainImages_;
     std::vector<VkImageView> swapchainImageViews_;
-
-    // Commands and sync
-    VkCommandPool commandPool_ = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> commandBuffers_;
+
+    VkCommandPool commandPool_ = VK_NULL_HANDLE;
     VkSemaphore imageAvailable_ = VK_NULL_HANDLE;
     VkSemaphore renderFinished_ = VK_NULL_HANDLE;
     VkFence inFlightFence_ = VK_NULL_HANDLE;
 
-    // Texture for the image
+    // Texture data
     VkImage textureImage_ = VK_NULL_HANDLE;
     VkDeviceMemory textureMemory_ = VK_NULL_HANDLE;
+    VkFormat textureFormat_ = VK_FORMAT_UNDEFINED;
     VkImageLayout textureLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     uint32_t textureWidth_ = 0;
     uint32_t textureHeight_ = 0;
-#endif
+    bool textureIsHdr_ = false;
+    bool textureIsSparse_ = false;
+
+    // Sparse image support
+    bool sparseImageSupport_ = false;
+    uint32_t tileSize_ = 256;
+    VkDeviceSize sparseImageMemoryRequirements_ = 0;
+    std::vector<TileInfo> imageTiles_;
+
+    // Error tracking
+    bool deviceLost_ = false;
+    bool swapchainOutOfDate_ = false;
+    bool vulkanAvailable_ = false;
+
+    // Library handle for Windows
+    HMODULE vulkanLibrary_ = nullptr;
+
+    // Software fallback
+    HWND fallbackHwnd_ = nullptr;
+    uint32_t fallbackWidth_ = 800;
+    uint32_t fallbackHeight_ = 600;
+    std::vector<uint8_t> fallbackBuffer_;
+
+    void* colorProcessor_ = nullptr;
+
+    // Helper functions
+    bool initInstance();
+    bool pickPhysicalDevice();
+    bool createDeviceAndQueues();
+    bool createSurface(HWND hwnd);
+    bool createCommandPool();
+    bool createSwapchain(uint32_t width, uint32_t height);
+    void destroySwapchain();
+    bool createSyncObjects();
+    void recreateSwapchain(uint32_t width, uint32_t height);
+
+    bool createTexture(uint32_t width, uint32_t height, bool isHdr);
+    void destroyTexture();
+    bool createStagingBuffer(VkDeviceSize size, VkBuffer& buffer, VkDeviceMemory& memory);
+    void transitionImageLayout(VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout);
+    void copyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width, uint32_t height);
+
+    // Sparse image functions
+    bool InitializeSparseImage(uint32_t width, uint32_t height, bool isHdr);
+    void LoadImageTile(uint32_t tileX, uint32_t tileY, const void* tileData, bool isHdr);
+
+    // Software fallback functions
+    bool initializeSoftwareFallback(HWND hwnd);
+    void renderSoftwareFallback(uint32_t width, uint32_t height);
+
+    uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
+
+    VkCommandBuffer beginSingleTimeCommands();
+    void endSingleTimeCommands(VkCommandBuffer commandBuffer);
 };

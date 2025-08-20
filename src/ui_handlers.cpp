@@ -65,10 +65,10 @@ static void OnPaint(HWND hWnd) {
 
     FillRect(memDC, &clientRect, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
 
-    if (g_ctx.hBitmap && !IsIconic(hWnd)) {
+    if (g_ctx.imageData.isValid() && !IsIconic(hWnd)) {
         DrawImage(memDC, clientRect, g_ctx);
     }
-    else if (!g_ctx.hBitmap) {
+    else if (!g_ctx.imageData.isValid()) {
         SetTextColor(memDC, RGB(255, 255, 255));
         SetBkMode(memDC, TRANSPARENT);
         DrawTextW(memDC, L"Right-click for options or drag an image here", -1, &clientRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -258,7 +258,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             PostQuitMessage(0);
             return 0;
         }
-        if (g_ctx.hBitmap && IsPointInImage(pt, {})) {
+        if (g_ctx.imageData.isValid() && IsPointInImage(pt, {})) {
             isDraggingImage = true;
             dragStart = pt;
             SetCapture(hWnd);

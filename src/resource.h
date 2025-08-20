@@ -1,5 +1,27 @@
 #pragma once
+#pragma once
 
+// Icon resource ID
+#define IDI_APPICON                     101
+
+// Menu command IDs
+#define IDM_OPEN                        1001
+#define IDM_SAVE                        1002
+#define IDM_SAVE_AS                     1003
+#define IDM_COPY                        1004
+#define IDM_PASTE                       1005
+#define IDM_EXIT                        1006
+#define IDM_NEXT_IMG                    1007
+#define IDM_PREV_IMG                    1008
+#define IDM_ZOOM_IN                     1009
+#define IDM_ZOOM_OUT                    1010
+#define IDM_FIT_TO_WINDOW              1011
+#define IDM_FULLSCREEN                  1012
+#define IDM_DELETE_IMG                  1013
+#define IDM_ROTATE_CW                   1014
+#define IDM_ROTATE_CCW                  1015
+#define IDM_SHOW_FILE_PATH             1016
+#define IDM_OPEN_LOCATION              1017
 #define IDI_APPICON                 101
 #define IDM_OPEN                    1001
 #define IDM_NEXT_IMG                1002

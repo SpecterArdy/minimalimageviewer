@@ -1,6 +1,10 @@
 #include "viewer.h"
 #include <winbase.h>
+#include <cwchar>
+#include <OpenColorIO/OpenColorIO.h>
 #include "vulkan_renderer.h"
+
+namespace OCIO = OCIO_NAMESPACE;
 
 AppContext g_ctx;
 
@@ -39,11 +43,49 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
         return 1;
     }
 
-    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_ctx.wicFactory)))) {
-        MessageBoxW(nullptr, L"Failed to create WIC Imaging Factory.", L"Error", MB_OK | MB_ICONERROR);
-        CoUninitialize();
-        return 1;
+    // Initialize OpenColorIO with proper fallback config
+    try {
+        // Try to get current config
+        g_ctx.ocioConfig = OCIO::GetCurrentConfig();
+
+        // If we got a config, validate it has basic color spaces
+        if (g_ctx.ocioConfig) {
+            bool hasBasicSpaces = false;
+            try {
+                int numSpaces = g_ctx.ocioConfig->getNumColorSpaces();
+                if (numSpaces > 0) {
+                    hasBasicSpaces = true;
+                }
+            } catch (...) {
+                hasBasicSpaces = false;
+            }
+
+            // If config is invalid, fall back to raw
+            if (!hasBasicSpaces) {
+                g_ctx.ocioConfig = OCIO::Config::CreateRaw();
+            }
+        }
+    } catch (const OCIO::Exception& e) {
+        // Fall back to raw config on any failure
+        try {
+            g_ctx.ocioConfig = OCIO::Config::CreateRaw();
+        } catch (const OCIO::Exception& e2) {
+            g_ctx.ocioConfig = nullptr;
+        }
+    } catch (...) {
+        // Ultimate fallback
+        try {
+            g_ctx.ocioConfig = OCIO::Config::CreateRaw();
+        } catch (...) {
+            g_ctx.ocioConfig = nullptr;
+        }
     }
+
+    // Initialize display device
+    g_ctx.displayDevice = "sRGB";
+
+    // Don't create display transform at startup - do it when needed
+    g_ctx.currentDisplayTransform = nullptr;
 
     WNDCLASSEXW wcex{};
     wcex.cbSize = sizeof(WNDCLASSEXW);
@@ -93,15 +135,54 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
         LocalFree(argv);
     }
 
+    // Initialize FPS timer baseline
+    g_ctx.fpsLastTimeMS = GetTickCount64();
+
+    // Non-blocking loop to drive continuous rendering and FPS updates
     MSG msg{};
-    while (GetMessage(&msg, nullptr, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+    for (;;) {
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                CoUninitialize();
+                return static_cast<int>(msg.wParam);
+            }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+
+        // Request a repaint to drive rendering
+        InvalidateRect(g_ctx.hWnd, nullptr, FALSE);
+
+        // FPS accounting
+        ++g_ctx.fpsFrameCount;
+        unsigned long long now = GetTickCount64();
+        unsigned long long elapsed = now - g_ctx.fpsLastTimeMS;
+        if (elapsed >= 1000ULL) {
+            g_ctx.fps = static_cast<float>(g_ctx.fpsFrameCount) * 1000.0f / static_cast<float>(elapsed);
+            g_ctx.fpsFrameCount = 0;
+            g_ctx.fpsLastTimeMS = now;
+
+            if (g_ctx.showFps) {
+                wchar_t title[256];
+                swprintf(title, 256, L"Minimal Image Viewer - %.1f FPS", g_ctx.fps);
+                SetWindowTextW(g_ctx.hWnd, title);
+            }
+        }
+
+        // Handle deferred renderer reset outside paint/draw for safety
+        if (g_ctx.rendererNeedsReset) {
+            if (g_ctx.renderer) {
+                g_ctx.renderer->Shutdown();
+                g_ctx.renderer.reset();
+            }
+            g_ctx.renderer = std::make_unique<VulkanRenderer>();
+            if (!g_ctx.renderer->Initialize(g_ctx.hWnd)) {
+                g_ctx.renderer.reset();
+            }
+            g_ctx.rendererNeedsReset = false;
+        }
+
+        // Small sleep to avoid busy-waiting
+        Sleep(1);
     }
-
-    if (g_ctx.hBitmap) DeleteObject(g_ctx.hBitmap);
-    g_ctx.wicFactory = nullptr;
-    CoUninitialize();
-
-    return static_cast<int>(msg.wParam);
 }
