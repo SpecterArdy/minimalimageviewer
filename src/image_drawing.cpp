@@ -4,6 +4,32 @@
 extern AppContext g_ctx;
 
 namespace {
+
+// ── DPI helpers for overlay text ─────────────────────────────────────────────
+static UINT GetDpiForHWND(HWND hwnd) {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        using GetDpiWinFn = UINT (WINAPI *)(HWND);
+        if (auto pGet = reinterpret_cast<GetDpiWinFn>(GetProcAddress(user32, "GetDpiForWindow"))) {
+            return pGet(hwnd);
+        }
+    }
+    HDC hdc = GetDC(hwnd);
+    UINT dpi = static_cast<UINT>(GetDeviceCaps(hdc, LOGPIXELSX));
+    ReleaseDC(hwnd, hdc);
+    return dpi ? dpi : 96u;
+}
+
+static HFONT CreateMessageFontForDpi(HWND hwnd) {
+    UINT dpi = GetDpiForHWND(hwnd);
+    NONCLIENTMETRICSW ncm{};
+    ncm.cbSize = sizeof(ncm);
+    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, ncm.cbSize, &ncm, 0);
+    LOGFONTW lf = ncm.lfMessageFont;
+    lf.lfHeight = MulDiv(lf.lfHeight, static_cast<int>(dpi), 96);
+    lf.lfQuality = CLEARTYPE_NATURAL_QUALITY;
+    return CreateFontIndirectW(&lf);
+}
     // Centralized zoom bounds
     constexpr float kMinZoom = 0.1f;
     constexpr float kMaxZoom = 8.0f;
@@ -78,7 +104,7 @@ void DrawImage(HDC hdc, const RECT& clientRect, const AppContext& ctx) {
                 : L"[OpenColorIO Info]: Color management disabled. (Set $OCIO to enable.)";
             const wchar_t* help  = L"Shortcuts: Ctrl+Wheel/+/– to zoom, Ctrl+0 to fit, Right-click for menu.";
 
-            HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            HFONT font = CreateMessageFontForDpi(g_ctx.hWnd);
             HFONT old = (HFONT)SelectObject(hdc, font);
 
             RECT r = clientRect;
@@ -92,6 +118,7 @@ void DrawImage(HDC hdc, const RECT& clientRect, const AppContext& ctx) {
             DrawTextW(hdc, help,  -1, &r, DT_CENTER | DT_TOP);
 
             SelectObject(hdc, old);
+            DeleteObject(font);
         }
         return;
     }

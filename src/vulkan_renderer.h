@@ -29,7 +29,13 @@ public:
     VulkanRenderer();
     ~VulkanRenderer();
 
+    // Optional progress callback: percent in [0,100], and a stage description
+    using ProgressCallback = void(*)(int percent, const wchar_t* stage);
+
     bool Initialize(HWND hwnd);
+    // Progress-enabled initialization (reports fine-grained steps)
+    bool InitializeWithProgress(HWND hwnd, ProgressCallback cb);
+
     void Shutdown();
     void Resize(uint32_t width, uint32_t height);
     void Render(uint32_t width, uint32_t height, float zoom, float offsetX, float offsetY, int rotationAngle);

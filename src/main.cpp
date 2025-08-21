@@ -4,6 +4,56 @@
 #include <OpenColorIO/OpenColorIO.h>
 #include "vulkan_renderer.h"
 
+// ───────────────────────────── DPI helpers ───────────────────────────────────
+static void EnableDpiAwareness() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        using SetCtxFn = BOOL (WINAPI *)(DPI_AWARENESS_CONTEXT);
+        if (auto pSetCtx = reinterpret_cast<SetCtxFn>(GetProcAddress(user32, "SetProcessDpiAwarenessContext"))) {
+            pSetCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            return;
+        }
+        using SetLegacyAwareFn = BOOL (WINAPI *)();
+        if (auto pSetLegacy = reinterpret_cast<SetLegacyAwareFn>(GetProcAddress(user32, "SetProcessDPIAware"))) {
+            pSetLegacy();
+        }
+    }
+    HMODULE shcore = LoadLibraryW(L"Shcore.dll");
+    if (shcore) {
+        using SetAwFn = HRESULT (WINAPI *)(int /*PROCESS_DPI_AWARENESS*/);
+        if (auto pSetAw = reinterpret_cast<SetAwFn>(GetProcAddress(shcore, "SetProcessDpiAwareness"))) {
+            pSetAw(2 /*PROCESS_PER_MONITOR_DPI_AWARE*/);
+        }
+        FreeLibrary(shcore);
+    }
+}
+
+static UINT GetDpiForHWND(HWND hwnd) {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        using GetDpiWinFn = UINT (WINAPI *)(HWND);
+        if (auto pGet = reinterpret_cast<GetDpiWinFn>(GetProcAddress(user32, "GetDpiForWindow"))) {
+            return pGet(hwnd);
+        }
+    }
+    HDC hdc = GetDC(hwnd);
+    UINT dpi = static_cast<UINT>(GetDeviceCaps(hdc, LOGPIXELSX));
+    ReleaseDC(hwnd, hdc);
+    return dpi ? dpi : 96u;
+}
+
+static HFONT CreateMessageFontForDpi(HWND hwnd) {
+    UINT dpi = GetDpiForHWND(hwnd);
+    NONCLIENTMETRICSW ncm{};
+    ncm.cbSize = sizeof(ncm);
+    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, ncm.cbSize, &ncm, 0);
+    LOGFONTW lf = ncm.lfMessageFont;
+    // Scale font height to window DPI; lfHeight is negative (character height)
+    lf.lfHeight = MulDiv(lf.lfHeight, static_cast<int>(dpi), 96);
+    lf.lfQuality = CLEARTYPE_NATURAL_QUALITY;
+    return CreateFontIndirectW(&lf);
+}
+
 // ───────────────────────────── Splash window helpers ─────────────────────────
 static LRESULT CALLBACK SplashWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -67,7 +117,7 @@ static void DrawSplashMessage(HWND splash, const wchar_t* line1, const wchar_t* 
     DeleteObject(bg);
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, RGB(220, 220, 220));
-    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HFONT font = CreateMessageFontForDpi(splash);
     HFONT old = (HFONT)SelectObject(hdc, font);
 
     RECT r = rc;
@@ -77,13 +127,64 @@ static void DrawSplashMessage(HWND splash, const wchar_t* line1, const wchar_t* 
     DrawTextW(hdc, line2, -1, &r, DT_CENTER | DT_TOP);
 
     SelectObject(hdc, old);
+    DeleteObject(font);
     ReleaseDC(splash, hdc);
+}
+
+// Draw/update a determinate progress bar on the splash (percent in [0,100])
+static void DrawSplashProgress(HWND splash, int percent, const wchar_t* stage) {
+    if (!splash) return;
+
+    HDC hdc = GetDC(splash);
+    RECT rc; GetClientRect(splash, &rc);
+
+    // Background
+    HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));
+    FillRect(hdc, &rc, bg);
+    DeleteObject(bg);
+
+    // Title + stage
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(220, 220, 220));
+    HFONT font = CreateMessageFontForDpi(splash);
+    HFONT old = (HFONT)SelectObject(hdc, font);
+
+    RECT r = rc;
+    r.top += 20;
+    DrawTextW(hdc, L"Minimal Image Viewer", -1, &r, DT_CENTER | DT_TOP);
+    r.top += 24;
+    DrawTextW(hdc, stage ? stage : L"", -1, &r, DT_CENTER | DT_TOP);
+
+    // Progress bar frame
+    const int barWidth = rc.right - rc.left - 80;
+    const int barHeight = 18;
+    const int barX = rc.left + 40;
+    const int barY = rc.bottom - 40;
+    RECT frame{ barX, barY, barX + barWidth, barY + barHeight };
+    HBRUSH frameBrush = CreateSolidBrush(RGB(80, 80, 80));
+    FrameRect(hdc, &frame, frameBrush);
+    DeleteObject(frameBrush);
+
+    // Fill
+    int fillWidth = (percent < 0 ? 0 : (percent > 100 ? 100 : percent)) * barWidth / 100;
+    RECT fill{ barX + 1, barY + 1, barX + 1 + fillWidth, barY + barHeight - 1 };
+    HBRUSH fillBrush = CreateSolidBrush(RGB(50, 150, 255));
+    FillRect(hdc, &fill, fillBrush);
+    DeleteObject(fillBrush);
+
+    SelectObject(hdc, old);
+    DeleteObject(font);
+    ReleaseDC(splash, hdc);
+
+    // Keep it topmost
+    SetWindowPos(splash, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
 // Pump pending messages so the splash repaints immediately
 static void PumpSplashMessages(HWND splash) {
     MSG msg{};
-    while (PeekMessageW(&msg, splash, 0, 0, PM_REMOVE)) {
+    // Pump all messages (not just window-filtered) to ensure painting
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -105,6 +206,9 @@ void CenterImage(bool resetZoom) {
 }
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow) {
+    // Enable per-monitor DPI awareness before any window is created
+    EnableDpiAwareness();
+
     HWND existingWnd = FindWindowW(L"MinimalImageViewer", nullptr);
     if (existingWnd) {
         SetForegroundWindow(existingWnd);
@@ -208,7 +312,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
     g_ctx.hWnd = CreateWindowW(
         wcex.lpszClassName,
         L"Minimal Image Viewer",
-        WS_POPUP, // keep hidden until Vulkan is ready so the splash stays visible
+        WS_POPUP, // hidden until Vulkan is ready so the splash stays visible
         CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
         nullptr, nullptr, hInstance, nullptr
     );
@@ -220,12 +324,19 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
 
     SetWindowLongPtr(g_ctx.hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&g_ctx));
 
-    // Initialize Vulkan renderer (show progress on splash)
-    DrawSplashMessage(splash, L"Creating Vulkan renderer...", L"Please wait");
+    // Initialize Vulkan renderer (accurate progress on splash)
+    DrawSplashProgress(splash, 0, L"Preparing to initialize Vulkan...");
     PumpSplashMessages(splash);
 
+    static HWND s_splash = nullptr;
+    s_splash = splash;
+    auto progressCb = [](int pct, const wchar_t* stage) {
+        DrawSplashProgress(s_splash, pct, stage);
+        PumpSplashMessages(s_splash);
+    };
+
     g_ctx.renderer = std::make_unique<VulkanRenderer>();
-    if (!g_ctx.renderer->Initialize(g_ctx.hWnd)) {
+    if (!g_ctx.renderer->InitializeWithProgress(g_ctx.hWnd, progressCb)) {
         if (splash) DestroyWindow(splash), splash = nullptr;
         MessageBoxW(nullptr, L"Failed to initialize Vulkan renderer.", L"Error", MB_OK | MB_ICONERROR);
         return 1;

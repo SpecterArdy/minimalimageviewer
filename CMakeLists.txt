@@ -44,6 +44,7 @@ add_executable(minimalimageviewer WIN32
         src/image_drawing.cpp
         src/image_io.cpp
         src/vulkan_renderer.cpp
+        src/vulkan_progress.cpp
         src/viewer.cpp
         src/vulkan_renderer.h
         src/viewer.h
