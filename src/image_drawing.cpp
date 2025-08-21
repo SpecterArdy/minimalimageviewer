@@ -4,10 +4,33 @@
 extern AppContext g_ctx;
 
 namespace {
-    // Centralized zoom bounds with a small render headroom to avoid exact-edge issues
+    // Centralized zoom bounds
     constexpr float kMinZoom = 0.1f;
     constexpr float kMaxZoom = 8.0f;
-    constexpr float kMaxRenderZoom = kMaxZoom * 0.999f;
+
+    // Conservative maximum viewport dimension to keep scaled image within safe GPU limits
+    // Many GPUs support >= 16384; use 8192 for extra safety.
+    constexpr float kSafeMaxViewportDim = 8192.0f;
+
+    // Keep the app state comfortably below the theoretical cap; render uses even more headroom.
+    constexpr float kStateHeadroom  = 0.90f;
+    constexpr float kRenderHeadroom = 0.85f;
+
+    // Compute a dynamic zoom cap so that scaled image dimensions stay well within safe bounds.
+    inline float ComputeDynamicZoomCap(uint32_t imageW, uint32_t imageH, bool rotated) {
+        float w = static_cast<float>(imageW);
+        float h = static_cast<float>(imageH);
+        if (rotated) std::swap(w, h);
+
+        float capByW = (w > 0.0f) ? (kSafeMaxViewportDim / w) : kMaxZoom;
+        float capByH = (h > 0.0f) ? (kSafeMaxViewportDim / h) : kMaxZoom;
+        float cap = std::min(capByW, capByH);
+
+        // Bound by global limits
+        if (cap > kMaxZoom) cap = kMaxZoom;
+        if (cap < kMinZoom) cap = kMinZoom;
+        return cap;
+    }
 
     // RAII guard for SRWLOCK shared (reader) access
     struct SrwSharedGuard {
@@ -28,7 +51,7 @@ namespace {
     };
 }
 
-void DrawImage(HDC /*hdc*/, const RECT& clientRect, const AppContext& ctx) {
+void DrawImage(HDC hdc, const RECT& clientRect, const AppContext& ctx) {
     SrwSharedGuard guard(&g_ctx.renderLock);
     RenderInProgressGuard rip(g_ctx.renderInProgress);
 
@@ -38,7 +61,42 @@ void DrawImage(HDC /*hdc*/, const RECT& clientRect, const AppContext& ctx) {
         return;
     }
 
-    if (g_ctx.renderer && !g_ctx.rendererNeedsReset && g_ctx.imageData.isValid()) {
+    // When no image is loaded, draw a startup overlay with instructions and OCIO status.
+    if (!g_ctx.imageData.isValid()) {
+        if (hdc) {
+            HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));
+            FillRect(hdc, &clientRect, bg);
+            DeleteObject(bg);
+
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, RGB(200, 200, 200));
+
+            const wchar_t* title = L"Minimal Image Viewer";
+            const wchar_t* info1 = L"Drag & drop an image here, or press Ctrl+O to open a file.";
+            const wchar_t* info2 = g_ctx.ocioEnabled
+                ? L"[OpenColorIO Info]: Color management enabled."
+                : L"[OpenColorIO Info]: Color management disabled. (Set $OCIO to enable.)";
+            const wchar_t* help  = L"Shortcuts: Ctrl+Wheel/+/– to zoom, Ctrl+0 to fit, Right-click for menu.";
+
+            HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            HFONT old = (HFONT)SelectObject(hdc, font);
+
+            RECT r = clientRect;
+            r.top += 40;
+            DrawTextW(hdc, title, -1, &r, DT_CENTER | DT_TOP);
+            r.top += 30;
+            DrawTextW(hdc, info1, -1, &r, DT_CENTER | DT_TOP);
+            r.top += 20;
+            DrawTextW(hdc, info2, -1, &r, DT_CENTER | DT_TOP);
+            r.top += 20;
+            DrawTextW(hdc, help,  -1, &r, DT_CENTER | DT_TOP);
+
+            SelectObject(hdc, old);
+        }
+        return;
+    }
+
+    if (g_ctx.renderer && !g_ctx.rendererNeedsReset) {
         // Re-upload texture ONLY when image data changes. Zoom now affects rendering only.
         static uint32_t s_lastImageWidth = 0;
         static uint32_t s_lastImageHeight = 0;
@@ -52,7 +110,6 @@ void DrawImage(HDC /*hdc*/, const RECT& clientRect, const AppContext& ctx) {
         const bool zoomChangedSignificantly = (zoomDelta >= 0.05f);
 
         if (imageChanged) {
-            // Use the unified pixels vector
             const void* pixelData = ctx.imageData.pixels.data();
 
             g_ctx.renderer->UpdateImageFromData(
@@ -64,15 +121,20 @@ void DrawImage(HDC /*hdc*/, const RECT& clientRect, const AppContext& ctx) {
             s_lastZoom = ctx.zoomFactor;
         }
 
-        // Render with current zoom/offset/rotation (apply strict safety clamp with headroom)
-        float safeZoom = ctx.zoomFactor;
-        if (safeZoom > kMaxRenderZoom) safeZoom = kMaxRenderZoom;
-        if (safeZoom < kMinZoom)      safeZoom = kMinZoom;
+        // Compute dynamic cap for current orientation
+        const bool rotated = (g_ctx.rotationAngle == 90 || g_ctx.rotationAngle == 270);
+        const float dynCap = ComputeDynamicZoomCap(ctx.imageData.width, ctx.imageData.height, rotated);
 
-        // Persist the clamped value so subsequent zoom-out starts from the cap
-        if (g_ctx.zoomFactor != safeZoom) {
-            g_ctx.zoomFactor = safeZoom;
-        }
+        // Enforce a conservative state cap every frame so zoom-out always responds after hitting limits
+        const float stateCap = dynCap * kStateHeadroom;
+        if (g_ctx.zoomFactor > stateCap) g_ctx.zoomFactor = stateCap;
+        if (g_ctx.zoomFactor < kMinZoom) g_ctx.zoomFactor = kMinZoom;
+
+        // Render with extra headroom to avoid edge-trigger flicker
+        const float renderCap = dynCap * kRenderHeadroom;
+        float safeZoom = g_ctx.zoomFactor;
+        if (safeZoom > renderCap) safeZoom = renderCap;
+        if (safeZoom < kMinZoom)  safeZoom = kMinZoom;
 
         g_ctx.renderer->Render(static_cast<uint32_t>(clientWidth), static_cast<uint32_t>(clientHeight),
                                safeZoom, ctx.offsetX, ctx.offsetY, ctx.rotationAngle);
@@ -80,7 +142,6 @@ void DrawImage(HDC /*hdc*/, const RECT& clientRect, const AppContext& ctx) {
         // Check for non-throwing error states and defer reset to main loop
         if (g_ctx.renderer->IsDeviceLost() || g_ctx.renderer->IsSwapchainOutOfDate()) {
             g_ctx.rendererNeedsReset = true;
-            // Force reupload next time after reset
             s_lastImageWidth = 0;
             s_lastImageHeight = 0;
             s_lastZoom = -1.0f;
@@ -107,9 +168,13 @@ void FitImageToWindow() {
     if (imageWidth <= 0 || imageHeight <= 0) return;
 
     g_ctx.zoomFactor = std::min(clientWidth / imageWidth, clientHeight / imageHeight);
-    // Enforce centralized bounds
-    if (g_ctx.zoomFactor > kMaxZoom) g_ctx.zoomFactor = kMaxZoom;
+
+    // Enforce dynamic cap derived from image dimensions plus global bounds
+    const bool rotated = (g_ctx.rotationAngle == 90 || g_ctx.rotationAngle == 270);
+    const float dynCap = ComputeDynamicZoomCap(g_ctx.imageData.width, g_ctx.imageData.height, rotated);
+    if (g_ctx.zoomFactor > dynCap) g_ctx.zoomFactor = dynCap;
     if (g_ctx.zoomFactor < kMinZoom) g_ctx.zoomFactor = kMinZoom;
+
     g_ctx.offsetX = 0.0f;
     g_ctx.offsetY = 0.0f;
     InvalidateRect(g_ctx.hWnd, nullptr, FALSE);
@@ -117,10 +182,27 @@ void FitImageToWindow() {
 
 void ZoomImage(float factor) {
     if (!g_ctx.imageData.isValid()) return;
-    g_ctx.zoomFactor *= factor;
-    // Clamp to centralized safe bounds
-    if (g_ctx.zoomFactor > kMaxZoom) g_ctx.zoomFactor = kMaxZoom;
-    if (g_ctx.zoomFactor < kMinZoom) g_ctx.zoomFactor = kMinZoom;
+
+    const bool rotated = (g_ctx.rotationAngle == 90 || g_ctx.rotationAngle == 270);
+    const float dynCap = ComputeDynamicZoomCap(g_ctx.imageData.width, g_ctx.imageData.height, rotated);
+
+    // Keep user-visible state comfortably below the theoretical cap.
+    const float stateCap = dynCap * kStateHeadroom;
+
+    float z = g_ctx.zoomFactor;
+
+    if (factor > 1.0f) {
+        // Zooming in: apply factor and clamp to the state cap
+        z *= factor;
+        if (z > stateCap) z = stateCap;
+    } else {
+        // Zooming out: if state overshot, start from the state cap so it responds immediately
+        if (z > stateCap) z = stateCap;
+        z *= factor;
+        if (z < kMinZoom) z = kMinZoom;
+    }
+
+    g_ctx.zoomFactor = z;
     InvalidateRect(g_ctx.hWnd, nullptr, FALSE);
 }
 

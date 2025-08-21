@@ -4,6 +4,91 @@
 #include <OpenColorIO/OpenColorIO.h>
 #include "vulkan_renderer.h"
 
+// ───────────────────────────── Splash window helpers ─────────────────────────
+static LRESULT CALLBACK SplashWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_ERASEBKGND: return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps{};
+            HDC hdc = BeginPaint(hWnd, &ps);
+            RECT rc; GetClientRect(hWnd, &rc);
+            HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));
+            FillRect(hdc, &rc, bg);
+            DeleteObject(bg);
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, RGB(220, 220, 220));
+            HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            HFONT old = (HFONT)SelectObject(hdc, font);
+            const wchar_t* title = L"Minimal Image Viewer";
+            RECT r = rc;
+            r.top += 20;
+            DrawTextW(hdc, title, -1, &r, DT_CENTER | DT_TOP);
+            SelectObject(hdc, old);
+            EndPaint(hWnd, &ps);
+            return 0;
+        }
+        default: return DefWindowProcW(hWnd, msg, wParam, lParam);
+    }
+}
+
+static HWND CreateSplashWindow(HINSTANCE hInstance) {
+    const wchar_t* splashClass = L"MinimalImageViewerSplash";
+    WNDCLASSEXW wcex{};
+    wcex.cbSize = sizeof(WNDCLASSEXW);
+    wcex.hInstance = hInstance;
+    wcex.lpfnWndProc = SplashWndProc;
+    wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wcex.lpszClassName = splashClass;
+    RegisterClassExW(&wcex);
+
+    // Centered small window
+    int width = 560, height = 180;
+    RECT wa{}; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    int x = (wa.right + wa.left - width) / 2;
+    int y = (wa.bottom + wa.top - height) / 2;
+
+    HWND hWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, splashClass, L"Starting Minimal Image Viewer",
+                                WS_POPUP,
+                                x, y, width, height, nullptr, nullptr, hInstance, nullptr);
+    ShowWindow(hWnd, SW_SHOWNOACTIVATE);
+    UpdateWindow(hWnd);
+    // Keep it topmost without activating
+    SetWindowPos(hWnd, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    return hWnd;
+}
+
+static void DrawSplashMessage(HWND splash, const wchar_t* line1, const wchar_t* line2) {
+    if (!splash) return;
+    HDC hdc = GetDC(splash);
+    RECT rc; GetClientRect(splash, &rc);
+    HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));
+    FillRect(hdc, &rc, bg);
+    DeleteObject(bg);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(220, 220, 220));
+    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HFONT old = (HFONT)SelectObject(hdc, font);
+
+    RECT r = rc;
+    r.top += 30;
+    DrawTextW(hdc, line1, -1, &r, DT_CENTER | DT_TOP);
+    r.top += 24;
+    DrawTextW(hdc, line2, -1, &r, DT_CENTER | DT_TOP);
+
+    SelectObject(hdc, old);
+    ReleaseDC(splash, hdc);
+}
+
+// Pump pending messages so the splash repaints immediately
+static void PumpSplashMessages(HWND splash) {
+    MSG msg{};
+    while (PeekMessageW(&msg, splash, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
 namespace OCIO = OCIO_NAMESPACE;
 
 AppContext g_ctx;
@@ -81,11 +166,33 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
         }
     }
 
+    // Determine whether OCIO is enabled by environment
+    bool envHasOCIO = false;
+    {
+        // Check Windows wide-character environment variable
+        const wchar_t* ocioEnv = _wgetenv(L"OCIO");
+        envHasOCIO = (ocioEnv && *ocioEnv);
+    }
+    g_ctx.ocioEnabled = envHasOCIO && static_cast<bool>(g_ctx.ocioConfig);
+
+    if (!g_ctx.ocioEnabled) {
+        OutputDebugStringA("[OpenColorIO Info]: Color management disabled. (Specify the $OCIO environment variable to enable.)\n");
+    }
+
     // Initialize display device
     g_ctx.displayDevice = "sRGB";
 
     // Don't create display transform at startup - do it when needed
     g_ctx.currentDisplayTransform = nullptr;
+
+    // ── Startup splash (boot sequence) ──
+    HWND splash = CreateSplashWindow(hInstance);
+    if (g_ctx.ocioEnabled) {
+        DrawSplashMessage(splash, L"Starting Minimal Image Viewer...", L"OpenColorIO: enabled");
+    } else {
+        DrawSplashMessage(splash, L"Starting Minimal Image Viewer...", L"OpenColorIO: disabled (set $OCIO to enable)");
+    }
+    PumpSplashMessages(splash);
 
     WNDCLASSEXW wcex{};
     wcex.cbSize = sizeof(WNDCLASSEXW);
@@ -101,7 +208,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
     g_ctx.hWnd = CreateWindowW(
         wcex.lpszClassName,
         L"Minimal Image Viewer",
-        WS_POPUP | WS_VISIBLE,
+        WS_POPUP, // keep hidden until Vulkan is ready so the splash stays visible
         CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
         nullptr, nullptr, hInstance, nullptr
     );
@@ -113,12 +220,19 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
 
     SetWindowLongPtr(g_ctx.hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&g_ctx));
 
-    // Initialize Vulkan renderer
+    // Initialize Vulkan renderer (show progress on splash)
+    DrawSplashMessage(splash, L"Creating Vulkan renderer...", L"Please wait");
+    PumpSplashMessages(splash);
+
     g_ctx.renderer = std::make_unique<VulkanRenderer>();
     if (!g_ctx.renderer->Initialize(g_ctx.hWnd)) {
+        if (splash) DestroyWindow(splash), splash = nullptr;
         MessageBoxW(nullptr, L"Failed to initialize Vulkan renderer.", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
+
+    // Close splash and show the main window only after Vulkan is ready
+    if (splash) { DestroyWindow(splash); splash = nullptr; }
 
     DragAcceptFiles(g_ctx.hWnd, TRUE);
 

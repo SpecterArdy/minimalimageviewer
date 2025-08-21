@@ -88,6 +88,7 @@ struct AppContext {
     OCIO::ConstConfigRcPtr ocioConfig;
     OCIO::ConstProcessorRcPtr currentDisplayTransform;
     std::string displayDevice = "sRGB";
+    bool ocioEnabled = false;
 
     bool showFilePath = false;
     std::wstring currentFilePathOverride;
