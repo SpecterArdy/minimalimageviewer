@@ -1,5 +1,6 @@
 #include "viewer.h"
 #include "vulkan_renderer.h"
+#include "logging.h"
 
 extern AppContext g_ctx;
 
@@ -124,6 +125,9 @@ void DrawImage(HDC hdc, const RECT& clientRect, const AppContext& ctx) {
     }
 
     if (g_ctx.renderer && !g_ctx.rendererNeedsReset) {
+        // Log current view parameters at the start of a draw
+        Logger::Info("Draw: client=%dx%d zoom=%.3f offset=(%.2f,%.2f) rot=%d",
+                     clientWidth, clientHeight, g_ctx.zoomFactor, g_ctx.offsetX, g_ctx.offsetY, g_ctx.rotationAngle);
         // Re-upload texture ONLY when image data changes. Zoom now affects rendering only.
         static uint32_t s_lastImageWidth = 0;
         static uint32_t s_lastImageHeight = 0;
@@ -168,6 +172,9 @@ void DrawImage(HDC hdc, const RECT& clientRect, const AppContext& ctx) {
 
         // Check for non-throwing error states and defer reset to main loop
         if (g_ctx.renderer->IsDeviceLost() || g_ctx.renderer->IsSwapchainOutOfDate()) {
+            Logger::Warn("Renderer signaled reset: deviceLost=%d swapchainOutOfDate=%d",
+                         g_ctx.renderer->IsDeviceLost() ? 1 : 0,
+                         g_ctx.renderer->IsSwapchainOutOfDate() ? 1 : 0);
             g_ctx.rendererNeedsReset = true;
             s_lastImageWidth = 0;
             s_lastImageHeight = 0;
@@ -209,6 +216,7 @@ void FitImageToWindow() {
 
 void ZoomImage(float factor) {
     if (!g_ctx.imageData.isValid()) return;
+    Logger::Info("Zoom request: factor=%.3f currentZoom=%.3f", factor, g_ctx.zoomFactor);
 
     const bool rotated = (g_ctx.rotationAngle == 90 || g_ctx.rotationAngle == 270);
     const float dynCap = ComputeDynamicZoomCap(g_ctx.imageData.width, g_ctx.imageData.height, rotated);

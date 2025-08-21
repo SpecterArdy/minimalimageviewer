@@ -1,8 +1,9 @@
 #include "viewer.h"
 #include <winbase.h>
 #include <cwchar>
-#include <OpenColorIO/OpenColorIO.h>
+#include "ocio_shim.h"
 #include "vulkan_renderer.h"
+#include "logging.h"
 
 // ───────────────────────────── DPI helpers ───────────────────────────────────
 static void EnableDpiAwareness() {
@@ -209,6 +210,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
     // Enable per-monitor DPI awareness before any window is created
     EnableDpiAwareness();
 
+    // Initialize logging and crash handlers as early as possible
+    Logger::Init(L"MinimalImageViewer");
+    Logger::InstallCrashHandlers();
+    Logger::Info("Application starting (pid=%lu)", GetCurrentProcessId());
+
     HWND existingWnd = FindWindowW(L"MinimalImageViewer", nullptr);
     if (existingWnd) {
         SetForegroundWindow(existingWnd);
@@ -281,6 +287,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
 
     if (!g_ctx.ocioEnabled) {
         OutputDebugStringA("[OpenColorIO Info]: Color management disabled. (Specify the $OCIO environment variable to enable.)\n");
+        Logger::Info("OpenColorIO: disabled (no $OCIO or no config)");
+    } else {
+        Logger::Info("OpenColorIO: enabled");
     }
 
     // Initialize display device
@@ -333,12 +342,18 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
     auto progressCb = [](int pct, const wchar_t* stage) {
         DrawSplashProgress(s_splash, pct, stage);
         PumpSplashMessages(s_splash);
+        Logger::Info("Vulkan init: %d%% - %s", pct, stage ? "stage" : "");
+        if (stage) {
+            Logger::InfoW(L"Vulkan stage: %s", stage);
+        }
     };
 
     g_ctx.renderer = std::make_unique<VulkanRenderer>();
     if (!g_ctx.renderer->InitializeWithProgress(g_ctx.hWnd, progressCb)) {
         if (splash) DestroyWindow(splash), splash = nullptr;
+        Logger::Error("Failed to initialize Vulkan renderer");
         MessageBoxW(nullptr, L"Failed to initialize Vulkan renderer.", L"Error", MB_OK | MB_ICONERROR);
+        Logger::Shutdown();
         return 1;
     }
 
@@ -368,6 +383,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
     for (;;) {
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) {
+                Logger::Info("WM_QUIT received, shutting down");
+                Logger::Shutdown();
                 CoUninitialize();
                 return static_cast<int>(msg.wParam);
             }
@@ -404,16 +421,29 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
             // Exclusive lock ensures no new rendering uses stale Vulkan handles during recovery
             AcquireSRWLockExclusive(&g_ctx.renderLock);
 
-            // Runtime safety policy: never destroy/recreate instance/device at runtime.
-            // Only (re)create the swapchain for current window size.
-            if (g_ctx.renderer) {
+            const bool deviceLost = (g_ctx.renderer && g_ctx.renderer->IsDeviceLost());
+            if (g_ctx.renderer && deviceLost) {
+                Logger::Warn("Reset: device lost detected — performing full renderer rebuild");
+                // Full teardown and reinit
+                g_ctx.renderer->Shutdown();
+                g_ctx.renderer.reset();
+                g_ctx.renderer = std::make_unique<VulkanRenderer>();
+                if (!g_ctx.renderer->Initialize(g_ctx.hWnd)) {
+                    Logger::Error("Reset: VulkanRenderer re-initialization FAILED after device lost");
+                    g_ctx.renderer.reset();
+                } else {
+                    Logger::Info("Reset: VulkanRenderer re-initialized after device lost");
+                }
+            } else if (g_ctx.renderer) {
+                // Swapchain-only path (e.g., out-of-date)
                 RECT cr{};
                 GetClientRect(g_ctx.hWnd, &cr);
                 uint32_t w = static_cast<uint32_t>(std::max<LONG>(1, cr.right - cr.left));
                 uint32_t h = static_cast<uint32_t>(std::max<LONG>(1, cr.bottom - cr.top));
+                Logger::Warn("Reset: swapchain recreation (w={}, h={})", w, h);
                 g_ctx.renderer->Resize(w, h);
-                // Recovery succeeded; clear transient flags so DrawImage proceeds
                 g_ctx.renderer->ClearErrorFlags();
+                Logger::Info("Reset: swapchain recreated");
             }
 
             g_ctx.rendererNeedsReset = false;
