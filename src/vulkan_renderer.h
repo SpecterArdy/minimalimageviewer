@@ -46,6 +46,8 @@ public:
     // Error state accessors
     bool IsDeviceLost() const { return deviceLost_; }
     bool IsSwapchainOutOfDate() const { return swapchainOutOfDate_; }
+    // Clear transient error flags after successful recovery (e.g., swapchain recreation)
+    void ClearErrorFlags() { deviceLost_ = false; swapchainOutOfDate_ = false; }
 
 private:
     // Vulkan objects

@@ -171,15 +171,28 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
 
         // Handle deferred renderer reset outside paint/draw for safety
         if (g_ctx.rendererNeedsReset) {
+            // Ensure no frame is currently issuing Vulkan work
+            while (g_ctx.renderInProgress.load(std::memory_order_acquire)) {
+                Sleep(0); // yield until current render completes
+            }
+
+            // Exclusive lock ensures no new rendering uses stale Vulkan handles during recovery
+            AcquireSRWLockExclusive(&g_ctx.renderLock);
+
+            // Runtime safety policy: never destroy/recreate instance/device at runtime.
+            // Only (re)create the swapchain for current window size.
             if (g_ctx.renderer) {
-                g_ctx.renderer->Shutdown();
-                g_ctx.renderer.reset();
+                RECT cr{};
+                GetClientRect(g_ctx.hWnd, &cr);
+                uint32_t w = static_cast<uint32_t>(std::max<LONG>(1, cr.right - cr.left));
+                uint32_t h = static_cast<uint32_t>(std::max<LONG>(1, cr.bottom - cr.top));
+                g_ctx.renderer->Resize(w, h);
+                // Recovery succeeded; clear transient flags so DrawImage proceeds
+                g_ctx.renderer->ClearErrorFlags();
             }
-            g_ctx.renderer = std::make_unique<VulkanRenderer>();
-            if (!g_ctx.renderer->Initialize(g_ctx.hWnd)) {
-                g_ctx.renderer.reset();
-            }
+
             g_ctx.rendererNeedsReset = false;
+            ReleaseSRWLockExclusive(&g_ctx.renderLock);
         }
 
         // Small sleep to avoid busy-waiting

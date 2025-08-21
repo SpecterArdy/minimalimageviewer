@@ -3,7 +3,35 @@
 
 extern AppContext g_ctx;
 
+namespace {
+    // Centralized zoom bounds with a small render headroom to avoid exact-edge issues
+    constexpr float kMinZoom = 0.1f;
+    constexpr float kMaxZoom = 8.0f;
+    constexpr float kMaxRenderZoom = kMaxZoom * 0.999f;
+
+    // RAII guard for SRWLOCK shared (reader) access
+    struct SrwSharedGuard {
+        SRWLOCK* lock;
+        explicit SrwSharedGuard(SRWLOCK* l) : lock(l) { AcquireSRWLockShared(lock); }
+        ~SrwSharedGuard() { ReleaseSRWLockShared(lock); }
+        SrwSharedGuard(const SrwSharedGuard&) = delete;
+        SrwSharedGuard& operator=(const SrwSharedGuard&) = delete;
+    };
+
+    // RAII guard to mark rendering as active
+    struct RenderInProgressGuard {
+        std::atomic<bool>& flag;
+        explicit RenderInProgressGuard(std::atomic<bool>& f) : flag(f) { flag.store(true, std::memory_order_release); }
+        ~RenderInProgressGuard() { flag.store(false, std::memory_order_release); }
+        RenderInProgressGuard(const RenderInProgressGuard&) = delete;
+        RenderInProgressGuard& operator=(const RenderInProgressGuard&) = delete;
+    };
+}
+
 void DrawImage(HDC /*hdc*/, const RECT& clientRect, const AppContext& ctx) {
+    SrwSharedGuard guard(&g_ctx.renderLock);
+    RenderInProgressGuard rip(g_ctx.renderInProgress);
+
     int clientWidth = clientRect.right - clientRect.left;
     int clientHeight = clientRect.bottom - clientRect.top;
     if (clientWidth <= 0 || clientHeight <= 0) {
@@ -11,7 +39,7 @@ void DrawImage(HDC /*hdc*/, const RECT& clientRect, const AppContext& ctx) {
     }
 
     if (g_ctx.renderer && !g_ctx.rendererNeedsReset && g_ctx.imageData.isValid()) {
-        // Re-upload texture when image data changes OR zoom changes significantly.
+        // Re-upload texture ONLY when image data changes. Zoom now affects rendering only.
         static uint32_t s_lastImageWidth = 0;
         static uint32_t s_lastImageHeight = 0;
         static float s_lastZoom = -1.0f;
@@ -23,7 +51,7 @@ void DrawImage(HDC /*hdc*/, const RECT& clientRect, const AppContext& ctx) {
         const float zoomDelta = (s_lastZoom < 0.0f) ? 1.0f : std::fabs(ctx.zoomFactor - s_lastZoom);
         const bool zoomChangedSignificantly = (zoomDelta >= 0.05f);
 
-        if (imageChanged || zoomChangedSignificantly) {
+        if (imageChanged) {
             // Use the unified pixels vector
             const void* pixelData = ctx.imageData.pixels.data();
 
@@ -36,9 +64,18 @@ void DrawImage(HDC /*hdc*/, const RECT& clientRect, const AppContext& ctx) {
             s_lastZoom = ctx.zoomFactor;
         }
 
-        // Render with current zoom/offset/rotation
+        // Render with current zoom/offset/rotation (apply strict safety clamp with headroom)
+        float safeZoom = ctx.zoomFactor;
+        if (safeZoom > kMaxRenderZoom) safeZoom = kMaxRenderZoom;
+        if (safeZoom < kMinZoom)      safeZoom = kMinZoom;
+
+        // Persist the clamped value so subsequent zoom-out starts from the cap
+        if (g_ctx.zoomFactor != safeZoom) {
+            g_ctx.zoomFactor = safeZoom;
+        }
+
         g_ctx.renderer->Render(static_cast<uint32_t>(clientWidth), static_cast<uint32_t>(clientHeight),
-                               ctx.zoomFactor, ctx.offsetX, ctx.offsetY, ctx.rotationAngle);
+                               safeZoom, ctx.offsetX, ctx.offsetY, ctx.rotationAngle);
 
         // Check for non-throwing error states and defer reset to main loop
         if (g_ctx.renderer->IsDeviceLost() || g_ctx.renderer->IsSwapchainOutOfDate()) {
@@ -70,6 +107,9 @@ void FitImageToWindow() {
     if (imageWidth <= 0 || imageHeight <= 0) return;
 
     g_ctx.zoomFactor = std::min(clientWidth / imageWidth, clientHeight / imageHeight);
+    // Enforce centralized bounds
+    if (g_ctx.zoomFactor > kMaxZoom) g_ctx.zoomFactor = kMaxZoom;
+    if (g_ctx.zoomFactor < kMinZoom) g_ctx.zoomFactor = kMinZoom;
     g_ctx.offsetX = 0.0f;
     g_ctx.offsetY = 0.0f;
     InvalidateRect(g_ctx.hWnd, nullptr, FALSE);
@@ -78,7 +118,9 @@ void FitImageToWindow() {
 void ZoomImage(float factor) {
     if (!g_ctx.imageData.isValid()) return;
     g_ctx.zoomFactor *= factor;
-    g_ctx.zoomFactor = std::max(0.01f, std::min(100.0f, g_ctx.zoomFactor));
+    // Clamp to centralized safe bounds
+    if (g_ctx.zoomFactor > kMaxZoom) g_ctx.zoomFactor = kMaxZoom;
+    if (g_ctx.zoomFactor < kMinZoom) g_ctx.zoomFactor = kMinZoom;
     InvalidateRect(g_ctx.hWnd, nullptr, FALSE);
 }
 

@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <atomic>
 
 #include "resource.h"
 
@@ -100,6 +101,12 @@ struct AppContext {
 
     // Renderer maintenance
     bool rendererNeedsReset = false;
+
+    // Synchronization: reader-writer lock for safe renderer access/reset
+    SRWLOCK renderLock = SRWLOCK_INIT;
+
+    // Tracks whether a render is currently issuing Vulkan commands
+    std::atomic<bool> renderInProgress{false};
 
     // Declarations only; definitions are out-of-line where VulkanRenderer is complete
     AppContext();
