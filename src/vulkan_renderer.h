@@ -76,6 +76,15 @@ private:
     std::vector<VkCommandBuffer> commandBuffers_;
 
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
+    
+    // Per-frame synchronization objects
+    static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
+    std::vector<VkSemaphore> imageAvailableSemaphores_;
+    std::vector<VkSemaphore> renderFinishedSemaphores_;
+    std::vector<VkFence> inFlightFences_;
+    uint32_t currentFrame_ = 0;
+    
+    // Legacy synchronization objects (for cleanup compatibility)
     VkSemaphore imageAvailable_ = VK_NULL_HANDLE;
     VkSemaphore renderFinished_ = VK_NULL_HANDLE;
     VkFence inFlightFence_ = VK_NULL_HANDLE;
@@ -100,6 +109,10 @@ private:
     bool deviceLost_ = false;
     bool swapchainOutOfDate_ = false;
     bool vulkanAvailable_ = false;
+    
+    // Enhanced device lost diagnostics
+    void LogDeviceLostDiagnostics(const char* context) const;
+    void LogVulkanObjectState() const;
 
     // Library handle for Windows
     HMODULE vulkanLibrary_ = nullptr;

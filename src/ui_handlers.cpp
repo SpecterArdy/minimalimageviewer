@@ -1,4 +1,6 @@
 #include "viewer.h"
+#include <cmath>
+#include "logging.h"
 
 extern AppContext g_ctx;
 
@@ -13,6 +15,10 @@ static RECT GetCloseButtonRect() {
 }
 
 static void OpenFileAction() {
+#ifdef HAVE_DATADOG
+    auto openSpan = Logger::CreateSpan("ui.open_file");
+#endif
+    
     wchar_t szFile[MAX_PATH] = { 0 };
     OPENFILENAMEW ofn = { sizeof(OPENFILENAMEW) };
     ofn.hwndOwner = g_ctx.hWnd;
@@ -21,12 +27,32 @@ static void OpenFileAction() {
     ofn.nMaxFile = MAX_PATH;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_EXPLORER;
     if (GetOpenFileNameW(&ofn)) {
+#ifdef HAVE_DATADOG
+        openSpan.set_tag("file_selected", "true");
+        std::string utf8Path;
+        int utf8Size = WideCharToMultiByte(CP_UTF8, 0, szFile, -1, nullptr, 0, nullptr, nullptr);
+        if (utf8Size > 0) {
+            std::vector<char> utf8Buf(utf8Size);
+            WideCharToMultiByte(CP_UTF8, 0, szFile, -1, utf8Buf.data(), utf8Size, nullptr, nullptr);
+            utf8Path = std::string(utf8Buf.data());
+            openSpan.set_tag("file_path", utf8Path);
+        }
+#endif
         LoadImageFromFile(szFile);
         GetImagesInDirectory(szFile);
+    } else {
+#ifdef HAVE_DATADOG
+        openSpan.set_tag("file_selected", "false");
+#endif
     }
 }
 
 static void ToggleFullScreen() {
+#ifdef HAVE_DATADOG
+    auto fullscreenSpan = Logger::CreateSpan("ui.toggle_fullscreen");
+    fullscreenSpan.set_tag("entering_fullscreen", !g_ctx.isFullScreen ? "true" : "false");
+#endif
+    
     if (!g_ctx.isFullScreen) {
         g_ctx.savedStyle = GetWindowLong(g_ctx.hWnd, GWL_STYLE);
         GetWindowRect(g_ctx.hWnd, &g_ctx.savedRect);
@@ -54,10 +80,21 @@ static void ToggleFullScreen() {
 //
 
 static void OnPaint(HWND hWnd) {
+#ifdef HAVE_DATADOG
+    auto paintSpan = Logger::CreateSpan("ui.paint");
+    paintSpan.set_tag("minimized", IsIconic(hWnd) ? "true" : "false");
+    paintSpan.set_tag("has_image", g_ctx.imageData.isValid() ? "true" : "false");
+#endif
+    
     PAINTSTRUCT ps{};
     HDC hdc = BeginPaint(hWnd, &ps);
     RECT clientRect{};
     GetClientRect(hWnd, &clientRect);
+    
+#ifdef HAVE_DATADOG
+    paintSpan.set_tag("width", std::to_string(clientRect.right));
+    paintSpan.set_tag("height", std::to_string(clientRect.bottom));
+#endif
 
     HDC memDC = CreateCompatibleDC(hdc);
     HBITMAP memBitmap = CreateCompatibleBitmap(hdc, clientRect.right, clientRect.bottom);
@@ -136,33 +173,126 @@ static void OnPaint(HWND hWnd) {
 }
 
 static void OnKeyDown(WPARAM wParam) {
+#ifdef HAVE_DATADOG
+    auto keySpan = Logger::CreateSpan("ui.keydown");
+    keySpan.set_tag("key_code", std::to_string(static_cast<int>(wParam)));
+#endif
+    
     bool ctrlPressed = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+#ifdef HAVE_DATADOG
+    keySpan.set_tag("ctrl_pressed", ctrlPressed ? "true" : "false");
+#endif
 
     switch (wParam) {
     case VK_RIGHT:
+#ifdef HAVE_DATADOG
+        keySpan.set_tag("action", "next_image");
+#endif
         if (!g_ctx.imageFiles.empty()) {
             g_ctx.currentImageIndex = (g_ctx.currentImageIndex + 1) % g_ctx.imageFiles.size();
             LoadImageFromFile(g_ctx.imageFiles[g_ctx.currentImageIndex].c_str());
         }
         break;
     case VK_LEFT:
+#ifdef HAVE_DATADOG
+        keySpan.set_tag("action", "previous_image");
+#endif
         if (!g_ctx.imageFiles.empty()) {
             g_ctx.currentImageIndex = (g_ctx.currentImageIndex - 1 + g_ctx.imageFiles.size()) % g_ctx.imageFiles.size();
             LoadImageFromFile(g_ctx.imageFiles[g_ctx.currentImageIndex].c_str());
         }
         break;
-    case VK_UP:    RotateImage(true); break;
-    case VK_DOWN:  RotateImage(false); break;
-    case VK_DELETE: DeleteCurrentImage(); break;
-    case VK_F11:   ToggleFullScreen(); break;
-    case VK_ESCAPE: PostQuitMessage(0); break;
-    case 'O':      if (ctrlPressed) OpenFileAction(); break;
-    case 'S':      if (ctrlPressed && (GetKeyState(VK_SHIFT) & 0x8000)) SaveImageAs(); else if (ctrlPressed) SaveImage(); break;
-    case 'C':      if (ctrlPressed) HandleCopy(); break;
-    case 'V':      if (ctrlPressed) HandlePaste(); break;
-    case '0':      if (ctrlPressed) CenterImage(true); break;
-    case VK_OEM_PLUS:  if (ctrlPressed) ZoomImage(1.25f); break;
-    case VK_OEM_MINUS: if (ctrlPressed) ZoomImage(0.8f); break;
+    case VK_UP:    
+#ifdef HAVE_DATADOG
+        keySpan.set_tag("action", "rotate_clockwise");
+#endif
+        RotateImage(true); 
+        break;
+    case VK_DOWN:  
+#ifdef HAVE_DATADOG
+        keySpan.set_tag("action", "rotate_counterclockwise");
+#endif
+        RotateImage(false); 
+        break;
+    case VK_DELETE: 
+#ifdef HAVE_DATADOG
+        keySpan.set_tag("action", "delete_image");
+#endif
+        DeleteCurrentImage(); 
+        break;
+    case VK_F11:   
+#ifdef HAVE_DATADOG
+        keySpan.set_tag("action", "toggle_fullscreen");
+#endif
+        ToggleFullScreen(); 
+        break;
+    case VK_ESCAPE: 
+#ifdef HAVE_DATADOG
+        keySpan.set_tag("action", "quit");
+#endif
+        PostQuitMessage(0); 
+        break;
+    case 'O':      
+        if (ctrlPressed) {
+#ifdef HAVE_DATADOG
+            keySpan.set_tag("action", "open_file");
+#endif
+            OpenFileAction();
+        }
+        break;
+    case 'S':      
+        if (ctrlPressed && (GetKeyState(VK_SHIFT) & 0x8000)) {
+#ifdef HAVE_DATADOG
+            keySpan.set_tag("action", "save_as");
+#endif
+            SaveImageAs();
+        } else if (ctrlPressed) {
+#ifdef HAVE_DATADOG
+            keySpan.set_tag("action", "save");
+#endif
+            SaveImage();
+        }
+        break;
+    case 'C':      
+        if (ctrlPressed) {
+#ifdef HAVE_DATADOG
+            keySpan.set_tag("action", "copy");
+#endif
+            HandleCopy();
+        }
+        break;
+    case 'V':      
+        if (ctrlPressed) {
+#ifdef HAVE_DATADOG
+            keySpan.set_tag("action", "paste");
+#endif
+            HandlePaste();
+        }
+        break;
+    case '0':      
+        if (ctrlPressed) {
+#ifdef HAVE_DATADOG
+            keySpan.set_tag("action", "center_image");
+#endif
+            CenterImage(true);
+        }
+        break;
+    case VK_OEM_PLUS:  
+        if (ctrlPressed) {
+#ifdef HAVE_DATADOG
+            keySpan.set_tag("action", "zoom_in");
+#endif
+            ZoomImage(1.25f);
+        }
+        break;
+    case VK_OEM_MINUS: 
+        if (ctrlPressed) {
+#ifdef HAVE_DATADOG
+            keySpan.set_tag("action", "zoom_out");
+#endif
+            ZoomImage(0.8f);
+        }
+        break;
     }
 }
 
@@ -285,10 +415,60 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             SendMessage(hWnd, WM_SETCURSOR, reinterpret_cast<WPARAM>(hWnd), MAKELPARAM(HTCLIENT, 0));
         }
         if (isDraggingImage) {
-            g_ctx.offsetX += (pt.x - dragStart.x) / g_ctx.zoomFactor;
-            g_ctx.offsetY += (pt.y - dragStart.y) / g_ctx.zoomFactor;
-            dragStart = pt;
-            InvalidateRect(hWnd, nullptr, FALSE);
+            // Safety check to prevent division by zero or invalid zoom factor
+            if (g_ctx.zoomFactor > 0.0f && std::isfinite(g_ctx.zoomFactor)) {
+                // NASA Standard: Calculate offset changes with bounds checking
+                float deltaX = static_cast<float>(pt.x - dragStart.x);
+                float deltaY = static_cast<float>(pt.y - dragStart.y);
+                
+                // NASA Standard: Prevent division by very small zoom factors
+                float safeDivisor = std::max(g_ctx.zoomFactor, 0.01f);
+                
+                float offsetDeltaX = deltaX / safeDivisor;
+                float offsetDeltaY = deltaY / safeDivisor;
+                
+                // NASA Standard: Validate offset deltas are finite
+                if (std::isfinite(offsetDeltaX) && std::isfinite(offsetDeltaY)) {
+                    // NASA Standard: Bound offset changes to prevent extreme values
+                    constexpr float kMaxOffsetDelta = 10000.0f;
+                    offsetDeltaX = std::clamp(offsetDeltaX, -kMaxOffsetDelta, kMaxOffsetDelta);
+                    offsetDeltaY = std::clamp(offsetDeltaY, -kMaxOffsetDelta, kMaxOffsetDelta);
+                    
+                    float newOffsetX = g_ctx.offsetX + offsetDeltaX;
+                    float newOffsetY = g_ctx.offsetY + offsetDeltaY;
+                    
+                    // NASA Standard: Bound absolute offset values to prevent integer overflow in renderer
+                    constexpr float kMaxAbsoluteOffset = 1000000.0f;
+                    if (std::isfinite(newOffsetX) && std::isfinite(newOffsetY) &&
+                        std::abs(newOffsetX) < kMaxAbsoluteOffset && 
+                        std::abs(newOffsetY) < kMaxAbsoluteOffset) {
+                        
+                        g_ctx.offsetX = newOffsetX;
+                        g_ctx.offsetY = newOffsetY;
+                        dragStart = pt;
+                        InvalidateRect(hWnd, nullptr, FALSE);
+                        
+                        // Log critical state for crash analysis if values are getting extreme
+                        if (std::abs(newOffsetX) > 100000.0f || std::abs(newOffsetY) > 100000.0f) {
+                            Logger::LogCriticalState(g_ctx.zoomFactor, g_ctx.offsetX, g_ctx.offsetY, "mouse_drag_extreme_offset");
+                        }
+                    } else {
+                        // Offset would be too large - stop dragging to prevent crash
+                        Logger::LogCriticalState(g_ctx.zoomFactor, newOffsetX, newOffsetY, "mouse_drag_prevented_crash");
+                        isDraggingImage = false;
+                        ReleaseCapture();
+                    }
+                } else {
+                    // Non-finite offset deltas - stop dragging
+                    isDraggingImage = false;
+                    ReleaseCapture();
+                }
+            } else {
+                // Reset zoom factor to safe value and stop dragging
+                g_ctx.zoomFactor = 1.0f;
+                isDraggingImage = false;
+                ReleaseCapture();
+            }
         }
         break;
     }

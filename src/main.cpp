@@ -196,6 +196,11 @@ namespace OCIO = OCIO_NAMESPACE;
 AppContext g_ctx;
 
 void CenterImage(bool resetZoom) {
+#ifdef HAVE_DATADOG
+    auto span = Logger::CreateSpan("center_image");
+    span.set_tag("reset_zoom", resetZoom ? "true" : "false");
+#endif
+    
     if (resetZoom) {
         g_ctx.zoomFactor = 1.0f;
     }
@@ -214,9 +219,28 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
     Logger::Init(L"MinimalImageViewer");
     Logger::InstallCrashHandlers();
     Logger::Info("Application starting (pid=%lu)", GetCurrentProcessId());
+    
+#ifdef HAVE_DATADOG
+    // Start root application span
+    auto appSpan = Logger::CreateSpan("application.startup");
+    appSpan.set_tag("pid", std::to_string(GetCurrentProcessId()));
+    if (lpCmdLine && *lpCmdLine) {
+        // Convert to UTF-8 for tagging
+        int utf8Size = WideCharToMultiByte(CP_UTF8, 0, lpCmdLine, -1, nullptr, 0, nullptr, nullptr);
+        if (utf8Size > 0) {
+            std::vector<char> utf8Buf(utf8Size);
+            WideCharToMultiByte(CP_UTF8, 0, lpCmdLine, -1, utf8Buf.data(), utf8Size, nullptr, nullptr);
+            appSpan.set_tag("command_line", std::string(utf8Buf.data()));
+        }
+    }
+#endif
 
+    try {
+
+    auto singleInstanceSpan = Logger::CreateChildSpan(appSpan, "check_single_instance");
     HWND existingWnd = FindWindowW(L"MinimalImageViewer", nullptr);
     if (existingWnd) {
+        singleInstanceSpan.set_tag("existing_instance_found", "true");
         SetForegroundWindow(existingWnd);
         if (IsIconic(existingWnd)) {
             ShowWindow(existingWnd, SW_RESTORE);
@@ -228,17 +252,23 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
             cds.lpData = lpCmdLine;
             SendMessage(existingWnd, WM_COPYDATA, reinterpret_cast<WPARAM>(hInstance), reinterpret_cast<LPARAM>(&cds));
         }
+        // spans are finished automatically when they go out of scope
         return 0;
     }
+    singleInstanceSpan.set_tag("existing_instance_found", "false");
 
     g_ctx.hInst = hInstance;
 
+    auto comInitSpan = Logger::CreateChildSpan(appSpan, "com_initialize");
     if (FAILED(CoInitialize(nullptr))) {
+        comInitSpan.set_tag("success", "false");
         MessageBoxW(nullptr, L"Failed to initialize COM.", L"Error", MB_OK | MB_ICONERROR);
         return 1;
     }
+    comInitSpan.set_tag("success", "true");
 
     // Initialize OpenColorIO with proper fallback config
+    auto ocioInitSpan = Logger::CreateChildSpan(appSpan, "ocio_initialize");
     try {
         // Try to get current config
         g_ctx.ocioConfig = OCIO::GetCurrentConfig();
@@ -284,6 +314,10 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
         envHasOCIO = (ocioEnv && *ocioEnv);
     }
     g_ctx.ocioEnabled = envHasOCIO && static_cast<bool>(g_ctx.ocioConfig);
+    
+    ocioInitSpan.set_tag("enabled", g_ctx.ocioEnabled ? "true" : "false");
+    ocioInitSpan.set_tag("env_has_ocio", envHasOCIO ? "true" : "false");
+    ocioInitSpan.set_tag("has_config", static_cast<bool>(g_ctx.ocioConfig) ? "true" : "false");
 
     if (!g_ctx.ocioEnabled) {
         OutputDebugStringA("[OpenColorIO Info]: Color management disabled. (Specify the $OCIO environment variable to enable.)\n");
@@ -299,6 +333,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
     g_ctx.currentDisplayTransform = nullptr;
 
     // ── Startup splash (boot sequence) ──
+    auto splashSpan = Logger::CreateChildSpan(appSpan, "splash_screen");
     HWND splash = CreateSplashWindow(hInstance);
     if (g_ctx.ocioEnabled) {
         DrawSplashMessage(splash, L"Starting Minimal Image Viewer...", L"OpenColorIO: enabled");
@@ -306,6 +341,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
         DrawSplashMessage(splash, L"Starting Minimal Image Viewer...", L"OpenColorIO: disabled (set $OCIO to enable)");
     }
     PumpSplashMessages(splash);
+    // splash span finishes automatically
 
     WNDCLASSEXW wcex{};
     wcex.cbSize = sizeof(WNDCLASSEXW);
@@ -334,6 +370,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
     SetWindowLongPtr(g_ctx.hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&g_ctx));
 
     // Initialize Vulkan renderer (accurate progress on splash)
+    auto vulkanInitSpan = Logger::CreateChildSpan(appSpan, "vulkan_initialize");
     DrawSplashProgress(splash, 0, L"Preparing to initialize Vulkan...");
     PumpSplashMessages(splash);
 
@@ -351,11 +388,13 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
     g_ctx.renderer = std::make_unique<VulkanRenderer>();
     if (!g_ctx.renderer->InitializeWithProgress(g_ctx.hWnd, progressCb)) {
         if (splash) DestroyWindow(splash), splash = nullptr;
+        vulkanInitSpan.set_tag("success", "false");
         Logger::Error("Failed to initialize Vulkan renderer");
         MessageBoxW(nullptr, L"Failed to initialize Vulkan renderer.", L"Error", MB_OK | MB_ICONERROR);
         Logger::Shutdown();
         return 1;
     }
+    vulkanInitSpan.set_tag("success", "true");
 
     // Close splash and show the main window only after Vulkan is ready
     if (splash) { DestroyWindow(splash); splash = nullptr; }
@@ -365,15 +404,20 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
     ShowWindow(g_ctx.hWnd, nCmdShow);
     UpdateWindow(g_ctx.hWnd);
 
+    auto cmdLineSpan = Logger::CreateChildSpan(appSpan, "process_command_line");
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv && argc > 1) {
+        cmdLineSpan.set_tag("has_file_argument", "true");
         LoadImageFromFile(argv[1]);
         GetImagesInDirectory(argv[1]);
+    } else {
+        cmdLineSpan.set_tag("has_file_argument", "false");
     }
     if (argv) {
         LocalFree(argv);
     }
+    // spans finish automatically when they go out of scope
 
     // Initialize FPS timer baseline
     g_ctx.fpsLastTimeMS = GetTickCount64();
@@ -383,6 +427,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
     for (;;) {
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) {
+                auto shutdownSpan = Logger::CreateSpan("application.shutdown");
                 Logger::Info("WM_QUIT received, shutting down");
                 Logger::Shutdown();
                 CoUninitialize();
@@ -413,6 +458,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
 
         // Handle deferred renderer reset outside paint/draw for safety
         if (g_ctx.rendererNeedsReset) {
+            auto resetSpan = Logger::CreateSpan("renderer.reset");
             // Ensure no frame is currently issuing Vulkan work
             while (g_ctx.renderInProgress.load(std::memory_order_acquire)) {
                 Sleep(0); // yield until current render completes
@@ -422,16 +468,20 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
             AcquireSRWLockExclusive(&g_ctx.renderLock);
 
             const bool deviceLost = (g_ctx.renderer && g_ctx.renderer->IsDeviceLost());
+            resetSpan.set_tag("device_lost", deviceLost ? "true" : "false");
             if (g_ctx.renderer && deviceLost) {
+                resetSpan.set_tag("reset_type", "full_rebuild");
                 Logger::Warn("Reset: device lost detected — performing full renderer rebuild");
                 // Full teardown and reinit
                 g_ctx.renderer->Shutdown();
                 g_ctx.renderer.reset();
                 g_ctx.renderer = std::make_unique<VulkanRenderer>();
                 if (!g_ctx.renderer->Initialize(g_ctx.hWnd)) {
+                    resetSpan.set_tag("success", "false");
                     Logger::Error("Reset: VulkanRenderer re-initialization FAILED after device lost");
                     g_ctx.renderer.reset();
                 } else {
+                    resetSpan.set_tag("success", "true");
                     Logger::Info("Reset: VulkanRenderer re-initialized after device lost");
                 }
             } else if (g_ctx.renderer) {
@@ -440,9 +490,13 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
                 GetClientRect(g_ctx.hWnd, &cr);
                 uint32_t w = static_cast<uint32_t>(std::max<LONG>(1, cr.right - cr.left));
                 uint32_t h = static_cast<uint32_t>(std::max<LONG>(1, cr.bottom - cr.top));
+                resetSpan.set_tag("reset_type", "swapchain_only");
+                resetSpan.set_tag("width", std::to_string(w));
+                resetSpan.set_tag("height", std::to_string(h));
                 Logger::Warn("Reset: swapchain recreation (w={}, h={})", w, h);
                 g_ctx.renderer->Resize(w, h);
                 g_ctx.renderer->ClearErrorFlags();
+                resetSpan.set_tag("success", "true");
                 Logger::Info("Reset: swapchain recreated");
             }
 
@@ -452,5 +506,18 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR 
 
         // Small sleep to avoid busy-waiting
         Sleep(1);
+    }
+    } catch (const std::exception& e) {
+        Logger::Error("Unhandled std::exception: %s", e.what());
+        Logger::LogStackTrace();
+        Logger::DumpNow("Unhandled std::exception");
+        Logger::Shutdown();
+        return 1;
+    } catch (...) {
+        Logger::Error("Unhandled unknown exception");
+        Logger::LogStackTrace();
+        Logger::DumpNow("Unhandled unknown exception");
+        Logger::Shutdown();
+        return 1;
     }
 }

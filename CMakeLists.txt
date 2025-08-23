@@ -5,6 +5,29 @@ set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Include CPM.cmake for dependency management
+include(cmake/CPM.cmake)
+
+# ── Build-mode options and ccache ────────────────────────────────────────────
+# Toggle portable distribution features (static CRTs + DLL bundling).
+option(PORTABLE_STANDALONE "Bundle runtime DLLs and link static CRTs for portable builds" OFF)
+# In Debug, default to fast local builds unless the user explicitly enables portability
+if (CMAKE_BUILD_TYPE MATCHES "Debug" AND NOT DEFINED PORTABLE_STANDALONE)
+    set(PORTABLE_STANDALONE OFF CACHE BOOL "" FORCE)
+endif()
+
+# Optional crash integrations (kept ON; you can toggle if needed)
+option(ENABLE_BREAKPAD "Enable Google Breakpad minidumps if available" ON)
+option(ENABLE_GLOG "Enable Google glog failure handler" ON)
+
+# Speed up rebuilds with ccache if present
+find_program(CCACHE_PROGRAM ccache)
+if (CCACHE_PROGRAM)
+    message(STATUS "Using ccache: ${CCACHE_PROGRAM}")
+    set(CMAKE_C_COMPILER_LAUNCHER   "${CCACHE_PROGRAM}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+endif()
+
 # ── MSYS2 UCRT64 early integration (needed before find_package(glog)) ───────
 if (MINGW)
     set(MSYS2_UCRT64_PREFIX "C:/msys64/ucrt64" CACHE PATH "MSYS2 UCRT64 root")
@@ -46,6 +69,26 @@ find_package(glog CONFIG REQUIRED)
 # so we locate them manually using the MSYS2 UCRT64 prefix paths below.
 set(HAVE_BREAKPAD OFF)
 set(HAVE_LIBUNWIND OFF)
+
+# ── Datadog C++ tracing library ────────────────────────────────────────────
+# Set up Datadog tracing library paths
+set(DATADOG_CPP_ROOT "C:/Program Files (x86)/dd-trace-cpp" CACHE PATH "Datadog C++ library root")
+set(DATADOG_CPP_INCLUDE_DIR "${DATADOG_CPP_ROOT}/include")
+set(DATADOG_CPP_LIB_DIR "${DATADOG_CPP_ROOT}/lib")
+
+# Find Datadog library
+find_library(DATADOG_CPP_LIB 
+    NAMES dd_trace_cpp-shared dd_trace_cpp-static
+    PATHS "${DATADOG_CPP_LIB_DIR}"
+    NO_DEFAULT_PATH)
+
+if(DATADOG_CPP_LIB AND EXISTS "${DATADOG_CPP_INCLUDE_DIR}")
+    message(STATUS "Datadog C++ library found: ${DATADOG_CPP_LIB}")
+    set(HAVE_DATADOG ON)
+else()
+    message(STATUS "Datadog C++ library not found, crash reporting will be disabled")
+    set(HAVE_DATADOG OFF)
+endif()
 
 # ── MSYS2 UCRT64 integration ────────────────────────────────────────────────
 # Use this profile with CLion's MinGW toolchain pointing at C:\msys64\ucrt64\bin
@@ -109,7 +152,6 @@ add_executable(minimalimageviewer WIN32
         src/image_drawing.cpp
         src/image_io.cpp
         src/vulkan_renderer.cpp
-        src/vulkan_progress.cpp
         src/logging.cpp
         src/viewer.cpp
         src/vulkan_renderer.h
@@ -137,7 +179,14 @@ else()
 endif()
 
 # Logging libraries
-target_link_libraries(minimalimageviewer PRIVATE spdlog::spdlog glog::glog)
+if (TARGET spdlog::spdlog_header_only)
+    target_link_libraries(minimalimageviewer PRIVATE spdlog::spdlog_header_only)
+else()
+    target_link_libraries(minimalimageviewer PRIVATE spdlog::spdlog)
+endif()
+if (ENABLE_GLOG)
+    target_link_libraries(minimalimageviewer PRIVATE glog::glog)
+endif()
 
 # Apply optional crash-capture integrations resolved from MSYS2 prefix
 if (HAVE_BREAKPAD)
@@ -150,6 +199,31 @@ if (HAVE_LIBUNWIND AND NOT MINGW)
     target_include_directories(minimalimageviewer PRIVATE "${LIBUNWIND_INCLUDE_DIR}")
     target_link_libraries(minimalimageviewer PRIVATE "${LIBUNWIND_LIB}")
     target_compile_definitions(minimalimageviewer PRIVATE HAVE_LIBUNWIND=1)
+endif()
+
+# Datadog integration
+if (HAVE_DATADOG)
+    target_include_directories(minimalimageviewer PRIVATE "${DATADOG_CPP_INCLUDE_DIR}")
+    target_link_libraries(minimalimageviewer PRIVATE "${DATADOG_CPP_LIB}")
+    target_compile_definitions(minimalimageviewer PRIVATE HAVE_DATADOG=1)
+    
+    # Copy Datadog DLLs to output directory
+    add_custom_command(TARGET minimalimageviewer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${DATADOG_CPP_ROOT}/lib/libdd_trace_cpp-shared.dll"
+            "$<TARGET_FILE_DIR:minimalimageviewer>"
+        COMMENT "Copying Datadog DLL to output directory"
+    )
+    
+    # Also copy libcurl.dll if it exists (dependency of Datadog)
+    if(EXISTS "${DATADOG_CPP_ROOT}/bin/libcurl.dll")
+        add_custom_command(TARGET minimalimageviewer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${DATADOG_CPP_ROOT}/bin/libcurl.dll"
+                "$<TARGET_FILE_DIR:minimalimageviewer>"
+            COMMENT "Copying libcurl.dll (Datadog dependency) to output directory"
+        )
+    endif()
 endif()
 
 # Include prebuilt resource on MSVC if available (adds icon/metadata)
@@ -166,12 +240,12 @@ if (WIN32)
             VK_USE_PLATFORM_WIN32_KHR
     )
     if (MINGW)
-        # Use Unicode entry point and statically link GCC and libstdc++ runtimes to avoid shipping those DLLs
-        target_link_options(minimalimageviewer PRIVATE
-                -municode
-                -static-libgcc
-                -static-libstdc++
-        )
+        # Always use Unicode entry point
+        target_link_options(minimalimageviewer PRIVATE -municode)
+        # Statically link GCC/libstdc++ only for portable distributions
+        if (PORTABLE_STANDALONE)
+            target_link_options(minimalimageviewer PRIVATE -static-libgcc -static-libstdc++)
+        endif()
     endif()
 
     target_link_libraries(minimalimageviewer PRIVATE
@@ -183,49 +257,53 @@ if (WIN32)
             shell32
             propsys
             oleaut32
+            dbghelp
+            wininet
+            version
+            psapi
     )
 
     if (MINGW)
-        # FINAL STEP: Forcefully embed a static winpthread to avoid any runtime dependency on libwinpthread-1.dll.
-        # Prefer the explicit static archive from MSYS2 UCRT64; try both common names.
-        set(WINPTHREAD_STATIC_CANDIDATES
-                "${MSYS2_UCRT64_PREFIX}/lib/libwinpthread.a"
-                "${MSYS2_UCRT64_PREFIX}/lib/libwinpthreads.a"
-        )
-        set(WINPTHREAD_STATIC_FOUND "")
-        foreach(CAND ${WINPTHREAD_STATIC_CANDIDATES})
-            if (EXISTS "${CAND}")
-                set(WINPTHREAD_STATIC_FOUND "${CAND}")
-                break()
+        if (PORTABLE_STANDALONE)
+            # Embed static winpthread to avoid runtime dependency on libwinpthread-1.dll.
+            set(WINPTHREAD_STATIC_CANDIDATES
+                    "${MSYS2_UCRT64_PREFIX}/lib/libwinpthread.a"
+                    "${MSYS2_UCRT64_PREFIX}/lib/libwinpthreads.a"
+            )
+            set(WINPTHREAD_STATIC_FOUND "")
+            foreach(CAND ${WINPTHREAD_STATIC_CANDIDATES})
+                if (EXISTS "${CAND}")
+                    set(WINPTHREAD_STATIC_FOUND "${CAND}")
+                    break()
+                endif()
+            endforeach()
+
+            if (WINPTHREAD_STATIC_FOUND)
+                target_link_libraries(minimalimageviewer PRIVATE
+                        -Wl,--whole-archive
+                        "${WINPTHREAD_STATIC_FOUND}"
+                        -Wl,--no-whole-archive
+                )
+            else()
+                target_link_libraries(minimalimageviewer PRIVATE
+                        -Wl,-Bstatic
+                        -lwinpthread
+                        -Wl,-Bdynamic
+                )
             endif()
-        endforeach()
 
-        if (WINPTHREAD_STATIC_FOUND)
-            # Use --whole-archive so the linker cannot drop it, guaranteeing no DLL required.
-            target_link_libraries(minimalimageviewer PRIVATE
-                    -Wl,--whole-archive
-                    "${WINPTHREAD_STATIC_FOUND}"
-                    -Wl,--no-whole-archive
-            )
-        else()
-            # Fallback to static link flags; still try to force static if the archive is in the search path.
-            target_link_libraries(minimalimageviewer PRIVATE
-                    -Wl,-Bstatic
-                    -lwinpthread
-                    -Wl,-Bdynamic
-            )
+            # Bundle dependent DLLs only for portable Release-type builds
+            if (CMAKE_BUILD_TYPE MATCHES "Release|RelWithDebInfo")
+                file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+                add_custom_command(TARGET minimalimageviewer POST_BUILD
+                        COMMAND "${CMAKE_COMMAND}"
+                            -DEXECUTABLE="$<TARGET_FILE:minimalimageviewer>"
+                            -DSEARCH_DIRS="${MSYS2_UCRT64_PREFIX}/bin;${MSYS2_UCRT64_PREFIX}/lib"
+                            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/BundleDeps.cmake"
+                        COMMENT "Bundling runtime DLLs (OCIO/OIIO and dependencies) next to the executable"
+                )
+            endif()
         endif()
-
-        # Post-build: bundle all dependent DLLs (OpenColorIO, OpenImageIO, and transitive deps)
-        # into the output directory so the EXE runs standalone.
-        file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-        add_custom_command(TARGET minimalimageviewer POST_BUILD
-                COMMAND "${CMAKE_COMMAND}"
-                    -DEXECUTABLE="$<TARGET_FILE:minimalimageviewer>"
-                    -DSEARCH_DIRS="${MSYS2_UCRT64_PREFIX}/bin;${MSYS2_UCRT64_PREFIX}/lib"
-                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/BundleDeps.cmake"
-                COMMENT "Bundling runtime DLLs (OCIO/OIIO and dependencies) next to the executable"
-        )
     endif()
 endif()
 

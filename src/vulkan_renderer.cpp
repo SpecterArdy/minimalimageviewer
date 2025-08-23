@@ -1,11 +1,24 @@
 #include "vulkan_renderer.h"
+#include "logging.h"
 #include <stdexcept>
 #include <cstring>
 #include <algorithm>
 #include <climits>
+#include <cmath>
+#include <string>
 
 #ifdef _WIN32
 #include <winreg.h>   // For registry functions (RegOpenKeyExA, RegCloseKey)
+#include <psapi.h>    // For PROCESS_MEMORY_COUNTERS_EX, GetProcessMemoryInfo
+
+// Helper function to convert wstring to string for logging
+static std::string w2u(const std::wstring& w) {
+    if (w.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string s(n > 0 ? n - 1 : 0, '\0');
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, s.data(), n, nullptr, nullptr);
+    return s;
+}
 
 // NASA Standard: No exceptions - use error codes for all failure paths
 static bool checkVulkanResult(VkResult r, const char* /*msg*/, bool& outDeviceLost, bool& outSwapchainOutOfDate) {
@@ -340,6 +353,12 @@ void VulkanRenderer::endSingleTimeCommands(VkCommandBuffer cmd) {
 }
 
 bool VulkanRenderer::createSwapchain(uint32_t width, uint32_t height) {
+    // WSI Standard: On Win32, window size may become (0, 0) when minimized
+    // and swapchain cannot be created until size changes from (0, 0)
+    if (width == 0 || height == 0) {
+        return false; // Cannot create swapchain with zero dimensions on Win32
+    }
+
     // Query formats
     uint32_t formatCount = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice_, surface_, &formatCount, nullptr);
@@ -361,14 +380,32 @@ bool VulkanRenderer::createSwapchain(uint32_t width, uint32_t height) {
     swapchainColorSpace_ = chosen.colorSpace;
 
     VkSurfaceCapabilitiesKHR caps{};
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice_, surface_, &caps);
+    VkResult capResult = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice_, surface_, &caps);
+    if (capResult != VK_SUCCESS) {
+        return false; // Cannot proceed without surface capabilities
+    }
 
+    // WSI Standard: Swapchain extent must exactly match window size
+    // currentExtent indicates if the surface size is determined by the swapchain extent
     VkExtent2D extent = caps.currentExtent;
     if (extent.width == UINT32_MAX) {
+        // Surface size will be determined by swapchain extent - use requested size with bounds check
         extent.width = std::clamp(width, caps.minImageExtent.width, caps.maxImageExtent.width);
         extent.height = std::clamp(height, caps.minImageExtent.height, caps.maxImageExtent.height);
+    } else {
+        // WSI Standard: Surface size is fixed by the platform - must use currentExtent exactly
+        // This is typical on Win32 where the window size determines the surface size
+        extent = caps.currentExtent;
     }
     swapchainExtent_ = extent;
+
+    // WSI Standard: Validate that the extent is within acceptable bounds
+    if (swapchainExtent_.width < caps.minImageExtent.width || 
+        swapchainExtent_.height < caps.minImageExtent.height ||
+        swapchainExtent_.width > caps.maxImageExtent.width ||
+        swapchainExtent_.height > caps.maxImageExtent.height) {
+        return false; // Extent violates surface capabilities
+    }
 
     uint32_t imageCount = std::clamp(2u, caps.minImageCount, (caps.maxImageCount ? caps.maxImageCount : 3u));
 
@@ -380,7 +417,7 @@ bool VulkanRenderer::createSwapchain(uint32_t width, uint32_t height) {
     sci.imageColorSpace = swapchainColorSpace_;
     sci.imageExtent = swapchainExtent_;
     sci.imageArrayLayers = 1;
-    sci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT; // We'll blit into it
+    sci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; // Support both blit and rendering
     uint32_t qfi[2] = { graphicsQueueFamily_, presentQueueFamily_ };
     if (graphicsQueueFamily_ != presentQueueFamily_) {
         sci.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
@@ -444,12 +481,24 @@ void VulkanRenderer::destroySwapchain() {
 }
 
 bool VulkanRenderer::createSyncObjects() {
-    VkSemaphoreCreateInfo si{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-    if (vkCreateSemaphore(device_, &si, nullptr, &imageAvailable_) != VK_SUCCESS) return false;
-    if (vkCreateSemaphore(device_, &si, nullptr, &renderFinished_) != VK_SUCCESS) return false;
-    VkFenceCreateInfo fi{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    if (vkCreateFence(device_, &fi, nullptr, &inFlightFence_) != VK_SUCCESS) return false;
+    // NASA Standard: Create per-frame synchronization objects to avoid semaphore reuse issues
+    imageAvailableSemaphores_.resize(MAX_FRAMES_IN_FLIGHT);
+    renderFinishedSemaphores_.resize(MAX_FRAMES_IN_FLIGHT);
+    inFlightFences_.resize(MAX_FRAMES_IN_FLIGHT);
+    
+    VkSemaphoreCreateInfo semaphoreInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT; // Start signaled
+    
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        if (vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &imageAvailableSemaphores_[i]) != VK_SUCCESS ||
+            vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &renderFinishedSemaphores_[i]) != VK_SUCCESS ||
+            vkCreateFence(device_, &fenceInfo, nullptr, &inFlightFences_[i]) != VK_SUCCESS) {
+            return false;
+        }
+    }
+    
+    currentFrame_ = 0; // Reset frame counter
     return true;
 }
 
@@ -629,6 +678,29 @@ void VulkanRenderer::Shutdown() {
     destroyTexture();
     destroySwapchain();
 
+    // NASA Standard: Clean up per-frame synchronization objects
+    for (size_t i = 0; i < imageAvailableSemaphores_.size(); ++i) {
+        if (imageAvailableSemaphores_[i] != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device_, imageAvailableSemaphores_[i], nullptr);
+        }
+    }
+    imageAvailableSemaphores_.clear();
+    
+    for (size_t i = 0; i < renderFinishedSemaphores_.size(); ++i) {
+        if (renderFinishedSemaphores_[i] != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device_, renderFinishedSemaphores_[i], nullptr);
+        }
+    }
+    renderFinishedSemaphores_.clear();
+    
+    for (size_t i = 0; i < inFlightFences_.size(); ++i) {
+        if (inFlightFences_[i] != VK_NULL_HANDLE) {
+            vkDestroyFence(device_, inFlightFences_[i], nullptr);
+        }
+    }
+    inFlightFences_.clear();
+
+    // NASA Standard: Clean up legacy single synchronization objects if they still exist
     if (imageAvailable_ != VK_NULL_HANDLE) {
         vkDestroySemaphore(device_, imageAvailable_, nullptr);
         imageAvailable_ = VK_NULL_HANDLE;
@@ -917,6 +989,9 @@ void VulkanRenderer::UpdateImageFromHDRData(const uint16_t* pixelData, uint32_t 
 }
 
 void VulkanRenderer::Render(uint32_t width, uint32_t height, float zoom, float offsetX, float offsetY, int /*rotationAngle*/) {
+    // WSI Standard: This method should be called from the main thread that owns the window
+    // to avoid deadlocks with Windows SendMessage API calls in Vulkan swapchain operations
+    
     // NASA Standard: Validate all input parameters
     if (width == 0 || height == 0 || width > 65536 || height > 65536) {
         return;
@@ -934,7 +1009,7 @@ void VulkanRenderer::Render(uint32_t width, uint32_t height, float zoom, float o
     }
 
     // NASA Standard: Validate zoom parameters to prevent GPU driver stress
-    if (zoom < 0.001f || zoom > 1000.0f) {
+    if (zoom < 0.001f || zoom > 10.0f || !std::isfinite(zoom)) {
         zoom = 1.0f; // Clamp to safe default
     }
 
@@ -949,11 +1024,15 @@ void VulkanRenderer::Render(uint32_t width, uint32_t height, float zoom, float o
         recreateSwapchain(width, height);
     }
 
-    vkWaitForFences(device_, 1, &inFlightFence_, VK_TRUE, UINT64_MAX);
-    vkResetFences(device_, 1, &inFlightFence_);
+    // NASA Standard: Use current frame synchronization objects
+    VkFence currentFence = inFlightFences_[currentFrame_];
+    VkSemaphore imageAvailableSemaphore = imageAvailableSemaphores_[currentFrame_];
+    VkSemaphore renderFinishedSemaphore = renderFinishedSemaphores_[currentFrame_];
+
+    vkWaitForFences(device_, 1, &currentFence, VK_TRUE, UINT64_MAX);
 
     uint32_t imageIndex = 0;
-    VkResult acq = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, imageAvailable_, VK_NULL_HANDLE, &imageIndex);
+    VkResult acq = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
     if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
         recreateSwapchain(width, height);
         return;
@@ -969,9 +1048,19 @@ void VulkanRenderer::Render(uint32_t width, uint32_t height, float zoom, float o
         return;
     }
 
-    // Transition swapchain image from PRESENT to TRANSFER_DST to avoid flicker
+    // NASA Standard: Proper initial layout transition for swapchain images
+    // Track if each swapchain image has been used before (starts as UNDEFINED, then PRESENT_SRC_KHR)
+    static thread_local std::vector<bool> imageUsed;
+    if (imageUsed.size() != swapchainImages_.size()) {
+        imageUsed.resize(swapchainImages_.size(), false);
+    }
+    
+    VkImageLayout initialLayout = imageUsed[imageIndex] ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_UNDEFINED;
+    imageUsed[imageIndex] = true;
+    
+    // Transition swapchain image to TRANSFER_DST for rendering
     VkImageMemoryBarrier pre{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-    pre.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    pre.oldLayout = initialLayout;
     pre.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     pre.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     pre.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -1002,16 +1091,71 @@ void VulkanRenderer::Render(uint32_t width, uint32_t height, float zoom, float o
         float imgH = static_cast<float>(textureHeight_);
 
         float fitScale = std::min(contentW / imgW, contentH / imgH);
-        float scale = fitScale * std::clamp(zoom, 0.01f, 100.0f);
+        float scale = fitScale * std::clamp(zoom, 0.01f, 10.0f);
 
         float drawW = imgW * scale;
         float drawH = imgH * scale;
         float cx = contentW * 0.5f + offsetX;
         float cy = contentH * 0.5f + offsetY;
-        int32_t dstX0 = static_cast<int32_t>(cx - drawW * 0.5f);
-        int32_t dstY0 = static_cast<int32_t>(cy - drawH * 0.5f);
-        int32_t dstX1 = static_cast<int32_t>(cx + drawW * 0.5f);
-        int32_t dstY1 = static_cast<int32_t>(cy + drawH * 0.5f);
+        
+        // NASA Standard: Prevent integer overflow when casting to int32_t
+        // Compute destination coordinates as floats first
+        float dstX0_f = cx - drawW * 0.5f;
+        float dstY0_f = cy - drawH * 0.5f;
+        float dstX1_f = cx + drawW * 0.5f;
+        float dstY1_f = cy + drawH * 0.5f;
+        
+        // NASA Standard: Validate coordinates are within int32_t range to prevent overflow
+        constexpr float kMaxInt32 = 2147483647.0f;  // INT32_MAX as float
+        constexpr float kMinInt32 = -2147483648.0f; // INT32_MIN as float
+        
+        // Check for potential overflow and clamp to safe values
+        if (!std::isfinite(dstX0_f) || !std::isfinite(dstY0_f) || 
+            !std::isfinite(dstX1_f) || !std::isfinite(dstY1_f) ||
+            dstX0_f < kMinInt32 || dstX0_f > kMaxInt32 ||
+            dstY0_f < kMinInt32 || dstY0_f > kMaxInt32 ||
+            dstX1_f < kMinInt32 || dstX1_f > kMaxInt32 ||
+            dstY1_f < kMinInt32 || dstY1_f > kMaxInt32) {
+            // Coordinates would overflow int32_t - use fallback safe coordinates
+            // Just draw a 1x1 pixel in center to avoid crash
+            int32_t centerX = static_cast<int32_t>(contentW * 0.5f);
+            int32_t centerY = static_cast<int32_t>(contentH * 0.5f);
+            dstX0_f = static_cast<float>(centerX);
+            dstY0_f = static_cast<float>(centerY);
+            dstX1_f = static_cast<float>(centerX + 1);
+            dstY1_f = static_cast<float>(centerY + 1);
+        }
+        
+        int32_t dstX0 = static_cast<int32_t>(dstX0_f);
+        int32_t dstY0 = static_cast<int32_t>(dstY0_f);
+        int32_t dstX1 = static_cast<int32_t>(dstX1_f);
+        int32_t dstY1 = static_cast<int32_t>(dstY1_f);
+        
+        // NASA Standard: Clamp blit coordinates to valid Vulkan spec bounds
+        // Per VUID-vkCmdBlitImage-dstOffset-00248: both dstOffsets must be >= 0 and <= image dimensions
+        int32_t swapchainWidth = static_cast<int32_t>(swapchainExtent_.width);
+        int32_t swapchainHeight = static_cast<int32_t>(swapchainExtent_.height);
+        
+        dstX0 = std::max(0, std::min(dstX0, swapchainWidth));
+        dstY0 = std::max(0, std::min(dstY0, swapchainHeight));
+        dstX1 = std::max(0, std::min(dstX1, swapchainWidth));
+        dstY1 = std::max(0, std::min(dstY1, swapchainHeight));
+        
+        // NASA Standard: Ensure we have a valid rectangle (x1 > x0, y1 > y0)
+        if (dstX1 <= dstX0) {
+            dstX1 = dstX0 + 1;
+            if (dstX1 > swapchainWidth) {
+                dstX0 = std::max(0, swapchainWidth - 1);
+                dstX1 = swapchainWidth;
+            }
+        }
+        if (dstY1 <= dstY0) {
+            dstY1 = dstY0 + 1;
+            if (dstY1 > swapchainHeight) {
+                dstY0 = std::max(0, swapchainHeight - 1);
+                dstY1 = swapchainHeight;
+            }
+        }
 
         VkImageBlit blit{};
         blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1054,31 +1198,17 @@ void VulkanRenderer::Render(uint32_t width, uint32_t height, float zoom, float o
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo submit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
     submit.waitSemaphoreCount = 1;
-    submit.pWaitSemaphores = &imageAvailable_;
+    submit.pWaitSemaphores = &imageAvailableSemaphore;
     submit.pWaitDstStageMask = &waitStage;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
     submit.signalSemaphoreCount = 1;
-    submit.pSignalSemaphores = &renderFinished_;
+    submit.pSignalSemaphores = &renderFinishedSemaphore;
 
-    // Non-blocking fence check to avoid UI stalls; adhere to defensive programming
-    VkResult fenceStatus = vkGetFenceStatus(device_, inFlightFence_);
-    if (fenceStatus == VK_SUCCESS) {
-        // Fence signaled; reset for next submit
-        vkResetFences(device_, 1, &inFlightFence_);
-    } else if (fenceStatus == VK_NOT_READY) {
-        // Fence is unsignaled; this is acceptable for submitting new work (do not reset)
-        // Proceed to submit so the first frame can render.
-    } else if (fenceStatus == VK_ERROR_DEVICE_LOST) {
-        deviceLost_ = true;
-        return;
-    } else {
-        // Unknown fence state; fail safe
-        deviceLost_ = true;
-        return;
-    }
+    // NASA Standard: Reset fence before submitting to avoid synchronization issues
+    vkResetFences(device_, 1, &currentFence);
 
-    VkResult sr = vkQueueSubmit(graphicsQueue_, 1, &submit, inFlightFence_);
+    VkResult sr = vkQueueSubmit(graphicsQueue_, 1, &submit, currentFence);
     if (sr == VK_ERROR_DEVICE_LOST) {
         deviceLost_ = true;
         return;
@@ -1090,7 +1220,7 @@ void VulkanRenderer::Render(uint32_t width, uint32_t height, float zoom, float o
 
     VkPresentInfoKHR present{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
     present.waitSemaphoreCount = 1;
-    present.pWaitSemaphores = &renderFinished_;
+    present.pWaitSemaphores = &renderFinishedSemaphore;
     present.swapchainCount = 1;
     present.pSwapchains = &swapchain_;
     present.pImageIndices = &imageIndex;
@@ -1106,6 +1236,9 @@ void VulkanRenderer::Render(uint32_t width, uint32_t height, float zoom, float o
         swapchainOutOfDate_ = true;
         return;
     }
+    
+    // NASA Standard: Advance to next frame for per-frame synchronization
+    currentFrame_ = (currentFrame_ + 1) % MAX_FRAMES_IN_FLIGHT;
 }
 
 // Additional method stubs for tiled/sparse image support
@@ -1597,6 +1730,185 @@ void VulkanRenderer::renderSoftwareFallback(uint32_t width, uint32_t height) {
 
         ReleaseDC(fallbackHwnd_, hdc);
     }
+}
+
+// Enhanced device lost diagnostics
+void VulkanRenderer::LogDeviceLostDiagnostics(const char* context) const {
+    const char* ctx = context ? context : "unknown";
+    Logger::Error("DEVICE_LOST_DIAGNOSTICS [%s]: Beginning comprehensive device lost analysis", ctx);
+    
+    // Log current Vulkan object state
+    LogVulkanObjectState();
+    
+#ifdef _WIN32
+    // Log GPU driver information
+    Logger::Error("=== GPU Driver State ===");
+    
+    // Check display devices again to see if anything changed
+    DISPLAY_DEVICEW dispDevice = {};
+    dispDevice.cb = sizeof(dispDevice);
+    bool foundActiveGPU = false;
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dispDevice, 0); ++i) {
+        if (dispDevice.StateFlags & DISPLAY_DEVICE_ACTIVE) {
+            foundActiveGPU = true;
+            std::string deviceName = w2u(dispDevice.DeviceString);
+            Logger::Error("Active GPU #{}: {} (StateFlags: 0x{:X})", i, 
+                        deviceName.c_str(), dispDevice.StateFlags);
+        }
+    }
+    
+    if (!foundActiveGPU) {
+        Logger::Error("WARNING: No active GPU devices found - possible driver crash/reset");
+    }
+    
+    // Check system memory status
+    MEMORYSTATUSEX memStatus = {};
+    memStatus.dwLength = sizeof(memStatus);
+    if (GlobalMemoryStatusEx(&memStatus)) {
+        Logger::Error("Memory at device lost: {:.2f} GB available ({:.1f}% used)",
+                    memStatus.ullAvailPhys / (1024.0 * 1024.0 * 1024.0),
+                    memStatus.dwMemoryLoad);
+        
+        if (memStatus.dwMemoryLoad > 95) {
+            Logger::Error("WARNING: System memory critically low - possible cause of device lost");
+        }
+        
+        if (memStatus.ullAvailPhys < (512ULL * 1024ULL * 1024ULL)) {
+            Logger::Error("WARNING: Available memory very low (< 512MB) - likely cause of device lost");
+        }
+    }
+    
+    // Log process memory usage
+    HANDLE hProcess = GetCurrentProcess();
+    PROCESS_MEMORY_COUNTERS_EX pmc = {};
+    if (GetProcessMemoryInfo(hProcess, (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
+        Logger::Error("Process memory at device lost: Working Set {:.2f} MB, Private {:.2f} MB",
+                    pmc.WorkingSetSize / (1024.0 * 1024.0),
+                    pmc.PrivateUsage / (1024.0 * 1024.0));
+        
+        if (pmc.WorkingSetSize > (2ULL * 1024ULL * 1024ULL * 1024ULL)) {
+            Logger::Error("WARNING: Process using > 2GB memory - possible memory leak causing device lost");
+        }
+    }
+    
+    // Check if Vulkan DLL is still accessible
+    HMODULE vulkanDLL = LoadLibraryA("vulkan-1.dll");
+    if (vulkanDLL) {
+        Logger::Error("Vulkan DLL: Still accessible after device lost");
+        FreeLibrary(vulkanDLL);
+    } else {
+        DWORD error = GetLastError();
+        Logger::Error("Vulkan DLL: No longer accessible after device lost (error {})", error);
+    }
+    
+    Logger::Error("=== End GPU Driver State ===");
+#endif
+    
+    Logger::Error("DEVICE_LOST_DIAGNOSTICS [%s]: Analysis complete", ctx);
+}
+
+void VulkanRenderer::LogVulkanObjectState() const {
+    Logger::Error("=== Vulkan Object State ===");
+    
+    Logger::Error("Instance: 0x{:016X} {}", (uintptr_t)instance_, 
+                instance_ != VK_NULL_HANDLE ? "(valid)" : "(NULL)");
+    Logger::Error("PhysicalDevice: 0x{:016X} {}", (uintptr_t)physicalDevice_, 
+                physicalDevice_ != VK_NULL_HANDLE ? "(valid)" : "(NULL)");
+    Logger::Error("Device: 0x{:016X} {}", (uintptr_t)device_, 
+                device_ != VK_NULL_HANDLE ? "(valid)" : "(NULL)");
+    Logger::Error("Surface: 0x{:016X} {}", (uintptr_t)surface_, 
+                surface_ != VK_NULL_HANDLE ? "(valid)" : "(NULL)");
+    Logger::Error("Swapchain: 0x{:016X} {}", (uintptr_t)swapchain_, 
+                swapchain_ != VK_NULL_HANDLE ? "(valid)" : "(NULL)");
+    
+    Logger::Error("Graphics Queue: 0x{:016X} (family: {})", (uintptr_t)graphicsQueue_, graphicsQueueFamily_);
+    Logger::Error("Present Queue: 0x{:016X} (family: {})", (uintptr_t)presentQueue_, presentQueueFamily_);
+    
+    Logger::Error("CommandPool: 0x{:016X} {}", (uintptr_t)commandPool_, 
+                commandPool_ != VK_NULL_HANDLE ? "(valid)" : "(NULL)");
+    Logger::Error("Texture Image: 0x{:016X} {}x{} {}", (uintptr_t)textureImage_, 
+                textureWidth_, textureHeight_,
+                textureImage_ != VK_NULL_HANDLE ? "(valid)" : "(NULL)");
+    
+    Logger::Error("Swapchain extent: {}x{}, format: 0x{:X}, {} images", 
+                swapchainExtent_.width, swapchainExtent_.height, 
+                (uint32_t)swapchainFormat_, swapchainImages_.size());
+    
+    Logger::Error("Error flags: deviceLost={}, swapchainOutOfDate={}, vulkanAvailable={}",
+                deviceLost_ ? "true" : "false",
+                swapchainOutOfDate_ ? "true" : "false",
+                vulkanAvailable_ ? "true" : "false");
+    
+    Logger::Error("=== End Vulkan Object State ===");
+}
+
+// Enhanced device lost checking with diagnostics
+bool VulkanRenderer::InitializeWithProgress(HWND hwnd, ProgressCallback cb) {
+    // NASA Standard: Validate input parameters
+    if (hwnd == nullptr || !IsWindow(hwnd)) {
+        return false;
+    }
+
+    // NASA Standard: Initialize all member variables to safe states
+    deviceLost_ = false;
+    swapchainOutOfDate_ = false;
+    vulkanAvailable_ = false;
+
+    if (cb) cb(5, L"Checking system and creating Vulkan instance...");
+
+    // NASA Standard: Attempt Vulkan initialization with full error protection
+    if (!initInstance()) {
+        if (cb) cb(100, L"Vulkan unavailable, using software fallback");
+        return initializeSoftwareFallback(hwnd);
+    }
+
+    if (cb) cb(20, L"Creating presentation surface...");
+    if (!createSurface(hwnd)) {
+        Shutdown();
+        return false;
+    }
+
+    if (cb) cb(35, L"Selecting physical device...");
+    if (!pickPhysicalDevice()) {
+        Shutdown();
+        return false;
+    }
+
+    if (cb) cb(55, L"Creating logical device and queues...");
+    if (!createDeviceAndQueues()) {
+        Shutdown();
+        return false;
+    }
+
+    if (cb) cb(65, L"Creating command pool...");
+    if (!createCommandPool()) {
+        Shutdown();
+        return false;
+    }
+
+    if (cb) cb(80, L"Creating swapchain...");
+    // Get initial window size for swapchain
+    RECT clientRect;
+    GetClientRect(hwnd, &clientRect);
+    uint32_t width = std::max<uint32_t>(1, static_cast<uint32_t>(clientRect.right - clientRect.left));
+    uint32_t height = std::max<uint32_t>(1, static_cast<uint32_t>(clientRect.bottom - clientRect.top));
+    
+    if (!createSwapchain(width, height)) {
+        Shutdown();
+        return false;
+    }
+
+    if (cb) cb(90, L"Creating synchronization primitives...");
+    if (!createSyncObjects()) {
+        Shutdown();
+        return false;
+    }
+
+    if (cb) cb(100, L"Vulkan ready");
+    
+    // NASA Standard: Mark Vulkan as available after successful initialization
+    vulkanAvailable_ = true;
+    return true;
 }
 
 #endif // _WIN32

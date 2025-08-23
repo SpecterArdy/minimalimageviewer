@@ -8,6 +8,7 @@
 #include <limits>
 
 #include "vulkan_renderer.h"
+#include "logging.h"
 
 namespace OCIO = OCIO_NAMESPACE;
 
@@ -46,17 +47,31 @@ static bool IsImageFile(const wchar_t* filePath) {
 }
 
 void LoadImageFromFile(const wchar_t* filePath) {
+#ifdef HAVE_DATADOG
+    auto loadSpan = Logger::CreateSpan("image.load");
+    
+    // Convert to UTF-8 for tagging
+    std::string utf8Path = wstring_to_utf8(filePath);
+    loadSpan.set_tag("file_path", utf8Path);
+#else
+    // Convert to UTF-8 for logging even without datadog
+    std::string utf8Path = wstring_to_utf8(filePath);
+#endif
+    
     g_ctx.imageData.clear();
     g_ctx.currentFilePathOverride.clear();
 
     // Clear any previous OpenImageIO errors
     OIIO::geterror();
 
-    std::string utf8Path = wstring_to_utf8(filePath);
     auto in = OIIO::ImageInput::open(utf8Path);
     if (!in) {
         // Clear any pending error and show what went wrong
         std::string error = OIIO::geterror();
+#ifdef HAVE_DATADOG
+        loadSpan.set_tag("success", "false");
+        loadSpan.set_tag("error", error);
+#endif
         if (!error.empty()) {
             std::wstring werror(error.begin(), error.end());
             MessageBoxW(g_ctx.hWnd, (L"Failed to open image: " + werror).c_str(), L"Image Load Error", MB_OK | MB_ICONWARNING);
@@ -70,6 +85,10 @@ void LoadImageFromFile(const wchar_t* filePath) {
     // NASA Standard: Validate all input parameters and bounds
     if (spec.width <= 0 || spec.height <= 0 || spec.width > 65536 || spec.height > 65536) {
         OIIO::geterror(); // Clear any errors
+#ifdef HAVE_DATADOG
+        loadSpan.set_tag("success", "false");
+        loadSpan.set_tag("error", "Invalid image dimensions");
+#endif
         CenterImage(true);
         return;
     }
@@ -80,16 +99,24 @@ void LoadImageFromFile(const wchar_t* filePath) {
     // NASA Standard: Validate computed values
     if (width == 0 || height == 0) {
         OIIO::geterror();
+#ifdef HAVE_DATADOG
+        loadSpan.set_tag("success", "false");
+        loadSpan.set_tag("error", "Zero dimensions after validation");
+#endif
         CenterImage(true);
         return;
     }
 
-    uint32_t channels = std::max(3u, static_cast<uint32_t>(spec.nchannels));
+    // Channels are always converted to 4 (RGBA)
 
     // NASA Standard: Prevent integer overflow in memory calculations
     const uint64_t maxPixels = UINT64_C(0x7FFFFFFF) / 16; // Conservative limit
     if (static_cast<uint64_t>(width) * static_cast<uint64_t>(height) > maxPixels) {
         OIIO::geterror();
+#ifdef HAVE_DATADOG
+        loadSpan.set_tag("success", "false");
+        loadSpan.set_tag("error", "Image too large for memory");
+#endif
         CenterImage(true);
         return;
     }
@@ -117,6 +144,16 @@ void LoadImageFromFile(const wchar_t* filePath) {
     g_ctx.imageData.height = height;
     g_ctx.imageData.isHdr = isHdr;
     g_ctx.imageData.channels = 4; // Always convert to RGBA
+    
+    // Tag image properties
+#ifdef HAVE_DATADOG
+    loadSpan.set_tag("width", std::to_string(width));
+    loadSpan.set_tag("height", std::to_string(height));
+    loadSpan.set_tag("is_hdr", isHdr ? "true" : "false");
+    loadSpan.set_tag("channels", "4");
+    loadSpan.set_tag("original_channels", std::to_string(spec.nchannels));
+    loadSpan.set_tag("format", formatName);
+#endif
 
     // Initialize OpenColorIO with comprehensive error handling (NASA coding standard)
     OCIO::ConstConfigRcPtr config = nullptr;
@@ -241,6 +278,10 @@ void LoadImageFromFile(const wchar_t* filePath) {
 
         if (pixelDataSize > SIZE_MAX || pixelDataSize > 0x40000000) { // 1GB limit
             OIIO::geterror();
+#ifdef HAVE_DATADOG
+            loadSpan.set_tag("success", "false");
+            loadSpan.set_tag("error", "HDR image data size exceeds limits");
+#endif
             CenterImage(true);
             return;
         }
@@ -250,6 +291,10 @@ void LoadImageFromFile(const wchar_t* filePath) {
         } catch (const std::bad_alloc& e) {
             // NASA Standard: Handle memory allocation failure
             OIIO::geterror();
+#ifdef HAVE_DATADOG
+            loadSpan.set_tag("success", "false");
+            loadSpan.set_tag("error", "Memory allocation failed for HDR pixels");
+#endif
             CenterImage(true);
             return;
         }
@@ -260,6 +305,10 @@ void LoadImageFromFile(const wchar_t* filePath) {
         } catch (const std::bad_alloc& e) {
             // NASA Standard: Handle memory allocation failure
             OIIO::geterror();
+#ifdef HAVE_DATADOG
+            loadSpan.set_tag("success", "false");
+            loadSpan.set_tag("error", "Memory allocation failed for float pixels");
+#endif
             g_ctx.imageData.clear();
             CenterImage(true);
             return;
@@ -410,6 +459,9 @@ void LoadImageFromFile(const wchar_t* filePath) {
 
     // Upload to Vulkan if renderer exists and image data is valid
     if (g_ctx.renderer && g_ctx.imageData.isValid()) {
+#ifdef HAVE_DATADOG
+        auto uploadSpan = Logger::CreateChildSpan(loadSpan, "vulkan.upload");
+#endif
         g_ctx.renderer->UpdateImageFromData(
             g_ctx.imageData.pixels.data(),
             g_ctx.imageData.width,
@@ -417,26 +469,50 @@ void LoadImageFromFile(const wchar_t* filePath) {
             g_ctx.imageData.isHdr
         );
     }
-
+    
+#ifdef HAVE_DATADOG
+    loadSpan.set_tag("success", "true");
+#endif
     CenterImage(true);
 }
 
 void GetImagesInDirectory(const wchar_t* filePath) {
+#ifdef HAVE_DATADOG
+    auto dirSpan = Logger::CreateSpan("image.scan_directory");
+#endif
+    
     // NASA Standard: Validate all input parameters
     if (filePath == nullptr) {
+#ifdef HAVE_DATADOG
+        dirSpan.set_tag("success", "false");
+        dirSpan.set_tag("error", "Null file path");
+#endif
         return;
     }
+    
+    std::string utf8Path = wstring_to_utf8(filePath);
+#ifdef HAVE_DATADOG
+    dirSpan.set_tag("file_path", utf8Path);
+#endif
 
     g_ctx.imageFiles.clear();
 
     // NASA Standard: Validate string length before copying
     size_t pathLength = wcsnlen(filePath, MAX_PATH);
     if (pathLength >= MAX_PATH) {
+#ifdef HAVE_DATADOG
+        dirSpan.set_tag("success", "false");
+        dirSpan.set_tag("error", "Path too long");
+#endif
         return; // Path too long
     }
 
     wchar_t folder[MAX_PATH] = { 0 };
     if (wcsncpy_s(folder, MAX_PATH, filePath, _TRUNCATE) != 0) {
+#ifdef HAVE_DATADOG
+        dirSpan.set_tag("success", "false");
+        dirSpan.set_tag("error", "Path copy failed");
+#endif
         return; // Copy failed
     }
 
@@ -445,6 +521,10 @@ void GetImagesInDirectory(const wchar_t* filePath) {
     WIN32_FIND_DATAW fd{};
     wchar_t searchPath[MAX_PATH] = { 0 };
     if (!PathCombineW(searchPath, folder, L"*.*")) {
+#ifdef HAVE_DATADOG
+        dirSpan.set_tag("success", "false");
+        dirSpan.set_tag("error", "Path combination failed");
+#endif
         return; // Path combination failed
     }
 
@@ -466,20 +546,41 @@ void GetImagesInDirectory(const wchar_t* filePath) {
         [&](const std::wstring& s) { return _wcsicmp(s.c_str(), filePath) == 0; }
     );
     g_ctx.currentImageIndex = (it != g_ctx.imageFiles.end()) ? static_cast<int>(std::distance(g_ctx.imageFiles.begin(), it)) : -1;
+    
+#ifdef HAVE_DATADOG
+    dirSpan.set_tag("success", "true");
+    dirSpan.set_tag("images_found", std::to_string(g_ctx.imageFiles.size()));
+    dirSpan.set_tag("current_index", std::to_string(g_ctx.currentImageIndex));
+#endif
 }
 
 void DeleteCurrentImage() {
+#ifdef HAVE_DATADOG
+    auto deleteSpan = Logger::CreateSpan("image.delete");
+#endif
+    
     // NASA Standard: Validate all bounds and indices
     if (g_ctx.currentImageIndex < 0 || 
         g_ctx.currentImageIndex >= static_cast<int>(g_ctx.imageFiles.size()) ||
         g_ctx.imageFiles.empty()) {
+#ifdef HAVE_DATADOG
+        deleteSpan.set_tag("success", "false");
+        deleteSpan.set_tag("error", "Invalid image index or empty file list");
+#endif
         return;
     }
 
     const std::wstring& filePathToDelete = g_ctx.imageFiles[g_ctx.currentImageIndex];
+#ifdef HAVE_DATADOG
+    deleteSpan.set_tag("file_path", wstring_to_utf8(filePathToDelete));
+#endif
 
     // NASA Standard: Validate path length before operations
     if (filePathToDelete.empty() || filePathToDelete.length() >= MAX_PATH) {
+#ifdef HAVE_DATADOG
+        deleteSpan.set_tag("success", "false");
+        deleteSpan.set_tag("error", "Invalid file path length");
+#endif
         return;
     }
 
@@ -489,12 +590,20 @@ void DeleteCurrentImage() {
         // NASA Standard: Check for potential overflow in buffer size calculation
         size_t requiredSize = filePathToDelete.length() + 2;
         if (requiredSize > MAX_PATH + 2) {
+#ifdef HAVE_DATADOG
+            deleteSpan.set_tag("success", "false");
+            deleteSpan.set_tag("error", "Path too long for deletion");
+#endif
             MessageBoxW(g_ctx.hWnd, L"File path is too long for deletion.", L"Error", MB_OK | MB_ICONERROR);
             return;
         }
 
         std::vector<wchar_t> pFromBuffer(requiredSize, 0);
         if (wcsncpy_s(pFromBuffer.data(), pFromBuffer.size(), filePathToDelete.c_str(), _TRUNCATE) != 0) {
+#ifdef HAVE_DATADOG
+            deleteSpan.set_tag("success", "false");
+            deleteSpan.set_tag("error", "Failed to prepare path for deletion");
+#endif
             MessageBoxW(g_ctx.hWnd, L"Failed to prepare file path for deletion.", L"Error", MB_OK | MB_ICONERROR);
             return;
         }
@@ -506,6 +615,9 @@ void DeleteCurrentImage() {
         sfos.fFlags = FOF_ALLOWUNDO | FOF_SILENT | FOF_NOCONFIRMATION;
 
         if (SHFileOperationW(&sfos) == 0 && !sfos.fAnyOperationsAborted) {
+#ifdef HAVE_DATADOG
+            deleteSpan.set_tag("success", "true");
+#endif
             g_ctx.imageFiles.erase(g_ctx.imageFiles.begin() + g_ctx.currentImageIndex);
             if (g_ctx.imageFiles.empty()) {
                 g_ctx.imageData.clear();
@@ -520,8 +632,17 @@ void DeleteCurrentImage() {
             }
         }
         else {
+#ifdef HAVE_DATADOG
+            deleteSpan.set_tag("success", "false");
+            deleteSpan.set_tag("error", "SHFileOperation failed");
+#endif
             MessageBoxW(g_ctx.hWnd, L"Failed to delete the file.", L"Error", MB_OK | MB_ICONERROR);
         }
+    } else {
+#ifdef HAVE_DATADOG
+        deleteSpan.set_tag("success", "false");
+        deleteSpan.set_tag("error", "User cancelled deletion");
+#endif
     }
 }
 
