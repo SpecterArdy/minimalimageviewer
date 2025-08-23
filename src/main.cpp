@@ -1,199 +1,37 @@
 #include "viewer.h"
-#include <winbase.h>
-#include <cwchar>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
+#include <iostream>
+#include <vector>
+#include <string>
 #include "ocio_shim.h"
 #include "vulkan_renderer.h"
 #include "logging.h"
-
-// ───────────────────────────── DPI helpers ───────────────────────────────────
-static void EnableDpiAwareness() {
-    HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    if (user32) {
-        using SetCtxFn = BOOL (WINAPI *)(DPI_AWARENESS_CONTEXT);
-        if (auto pSetCtx = reinterpret_cast<SetCtxFn>(GetProcAddress(user32, "SetProcessDpiAwarenessContext"))) {
-            pSetCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-            return;
-        }
-        using SetLegacyAwareFn = BOOL (WINAPI *)();
-        if (auto pSetLegacy = reinterpret_cast<SetLegacyAwareFn>(GetProcAddress(user32, "SetProcessDPIAware"))) {
-            pSetLegacy();
-        }
-    }
-    HMODULE shcore = LoadLibraryW(L"Shcore.dll");
-    if (shcore) {
-        using SetAwFn = HRESULT (WINAPI *)(int /*PROCESS_DPI_AWARENESS*/);
-        if (auto pSetAw = reinterpret_cast<SetAwFn>(GetProcAddress(shcore, "SetProcessDpiAwareness"))) {
-            pSetAw(2 /*PROCESS_PER_MONITOR_DPI_AWARE*/);
-        }
-        FreeLibrary(shcore);
-    }
-}
-
-static UINT GetDpiForHWND(HWND hwnd) {
-    HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    if (user32) {
-        using GetDpiWinFn = UINT (WINAPI *)(HWND);
-        if (auto pGet = reinterpret_cast<GetDpiWinFn>(GetProcAddress(user32, "GetDpiForWindow"))) {
-            return pGet(hwnd);
-        }
-    }
-    HDC hdc = GetDC(hwnd);
-    UINT dpi = static_cast<UINT>(GetDeviceCaps(hdc, LOGPIXELSX));
-    ReleaseDC(hwnd, hdc);
-    return dpi ? dpi : 96u;
-}
-
-static HFONT CreateMessageFontForDpi(HWND hwnd) {
-    UINT dpi = GetDpiForHWND(hwnd);
-    NONCLIENTMETRICSW ncm{};
-    ncm.cbSize = sizeof(ncm);
-    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, ncm.cbSize, &ncm, 0);
-    LOGFONTW lf = ncm.lfMessageFont;
-    // Scale font height to window DPI; lfHeight is negative (character height)
-    lf.lfHeight = MulDiv(lf.lfHeight, static_cast<int>(dpi), 96);
-    lf.lfQuality = CLEARTYPE_NATURAL_QUALITY;
-    return CreateFontIndirectW(&lf);
-}
-
-// ───────────────────────────── Splash window helpers ─────────────────────────
-static LRESULT CALLBACK SplashWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-        case WM_ERASEBKGND: return 1;
-        case WM_PAINT: {
-            PAINTSTRUCT ps{};
-            HDC hdc = BeginPaint(hWnd, &ps);
-            RECT rc; GetClientRect(hWnd, &rc);
-            HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));
-            FillRect(hdc, &rc, bg);
-            DeleteObject(bg);
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, RGB(220, 220, 220));
-            HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-            HFONT old = (HFONT)SelectObject(hdc, font);
-            const wchar_t* title = L"Minimal Image Viewer";
-            RECT r = rc;
-            r.top += 20;
-            DrawTextW(hdc, title, -1, &r, DT_CENTER | DT_TOP);
-            SelectObject(hdc, old);
-            EndPaint(hWnd, &ps);
-            return 0;
-        }
-        default: return DefWindowProcW(hWnd, msg, wParam, lParam);
-    }
-}
-
-static HWND CreateSplashWindow(HINSTANCE hInstance) {
-    const wchar_t* splashClass = L"MinimalImageViewerSplash";
-    WNDCLASSEXW wcex{};
-    wcex.cbSize = sizeof(WNDCLASSEXW);
-    wcex.hInstance = hInstance;
-    wcex.lpfnWndProc = SplashWndProc;
-    wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wcex.lpszClassName = splashClass;
-    RegisterClassExW(&wcex);
-
-    // Centered small window
-    int width = 560, height = 180;
-    RECT wa{}; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-    int x = (wa.right + wa.left - width) / 2;
-    int y = (wa.bottom + wa.top - height) / 2;
-
-    HWND hWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, splashClass, L"Starting Minimal Image Viewer",
-                                WS_POPUP,
-                                x, y, width, height, nullptr, nullptr, hInstance, nullptr);
-    ShowWindow(hWnd, SW_SHOWNOACTIVATE);
-    UpdateWindow(hWnd);
-    // Keep it topmost without activating
-    SetWindowPos(hWnd, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    return hWnd;
-}
-
-static void DrawSplashMessage(HWND splash, const wchar_t* line1, const wchar_t* line2) {
-    if (!splash) return;
-    HDC hdc = GetDC(splash);
-    RECT rc; GetClientRect(splash, &rc);
-    HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));
-    FillRect(hdc, &rc, bg);
-    DeleteObject(bg);
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, RGB(220, 220, 220));
-    HFONT font = CreateMessageFontForDpi(splash);
-    HFONT old = (HFONT)SelectObject(hdc, font);
-
-    RECT r = rc;
-    r.top += 30;
-    DrawTextW(hdc, line1, -1, &r, DT_CENTER | DT_TOP);
-    r.top += 24;
-    DrawTextW(hdc, line2, -1, &r, DT_CENTER | DT_TOP);
-
-    SelectObject(hdc, old);
-    DeleteObject(font);
-    ReleaseDC(splash, hdc);
-}
-
-// Draw/update a determinate progress bar on the splash (percent in [0,100])
-static void DrawSplashProgress(HWND splash, int percent, const wchar_t* stage) {
-    if (!splash) return;
-
-    HDC hdc = GetDC(splash);
-    RECT rc; GetClientRect(splash, &rc);
-
-    // Background
-    HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));
-    FillRect(hdc, &rc, bg);
-    DeleteObject(bg);
-
-    // Title + stage
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, RGB(220, 220, 220));
-    HFONT font = CreateMessageFontForDpi(splash);
-    HFONT old = (HFONT)SelectObject(hdc, font);
-
-    RECT r = rc;
-    r.top += 20;
-    DrawTextW(hdc, L"Minimal Image Viewer", -1, &r, DT_CENTER | DT_TOP);
-    r.top += 24;
-    DrawTextW(hdc, stage ? stage : L"", -1, &r, DT_CENTER | DT_TOP);
-
-    // Progress bar frame
-    const int barWidth = rc.right - rc.left - 80;
-    const int barHeight = 18;
-    const int barX = rc.left + 40;
-    const int barY = rc.bottom - 40;
-    RECT frame{ barX, barY, barX + barWidth, barY + barHeight };
-    HBRUSH frameBrush = CreateSolidBrush(RGB(80, 80, 80));
-    FrameRect(hdc, &frame, frameBrush);
-    DeleteObject(frameBrush);
-
-    // Fill
-    int fillWidth = (percent < 0 ? 0 : (percent > 100 ? 100 : percent)) * barWidth / 100;
-    RECT fill{ barX + 1, barY + 1, barX + 1 + fillWidth, barY + barHeight - 1 };
-    HBRUSH fillBrush = CreateSolidBrush(RGB(50, 150, 255));
-    FillRect(hdc, &fill, fillBrush);
-    DeleteObject(fillBrush);
-
-    SelectObject(hdc, old);
-    DeleteObject(font);
-    ReleaseDC(splash, hdc);
-
-    // Keep it topmost
-    SetWindowPos(splash, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-}
-
-// Pump pending messages so the splash repaints immediately
-static void PumpSplashMessages(HWND splash) {
-    MSG msg{};
-    // Pump all messages (not just window-filtered) to ensure painting
-    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-}
+#include "text_renderer.h"
 
 namespace OCIO = OCIO_NAMESPACE;
 
 AppContext g_ctx;
+
+// Convert wide string to UTF-8
+std::string wstring_to_utf8(const std::wstring& wstr) {
+    if (wstr.empty()) return "";
+    
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), nullptr, 0, nullptr, nullptr);
+    std::string strTo(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, nullptr, nullptr);
+    return strTo;
+}
+
+// Convert UTF-8 to wide string
+std::wstring utf8_to_wstring(const std::string& str) {
+    if (str.empty()) return L"";
+    
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), nullptr, 0);
+    std::wstring wstrTo(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0], size_needed);
+    return wstrTo;
+}
 
 void CenterImage(bool resetZoom) {
 #ifdef HAVE_DATADOG
@@ -208,316 +46,454 @@ void CenterImage(bool resetZoom) {
     g_ctx.offsetX = 0.0f;
     g_ctx.offsetY = 0.0f;
     FitImageToWindow();
-    InvalidateRect(g_ctx.hWnd, nullptr, FALSE);
 }
 
-int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow) {
-    // Enable per-monitor DPI awareness before any window is created
-    EnableDpiAwareness();
+void HandleSDLEvent(const SDL_Event& event) {
+    switch (event.type) {
+        case SDL_EVENT_DROP_FILE:
+            if (event.drop.data) {
+                Logger::Info("Dropped file: %s", event.drop.data);
+                LoadImageFromFile(event.drop.data);
+                GetImagesInDirectory(event.drop.data);
+            }
+            break;
+            
+        case SDL_EVENT_KEY_DOWN:
+            HandleKeyboardEvent(event.key);
+            break;
+            
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            HandleMouseEvent(event.button);
+            break;
+            
+        case SDL_EVENT_MOUSE_MOTION:
+            HandleMouseMotion(event.motion);
+            break;
+            
+        case SDL_EVENT_MOUSE_WHEEL:
+            HandleMouseWheel(event.wheel);
+            break;
+            
+        case SDL_EVENT_WINDOW_RESIZED:
+            FitImageToWindow();
+            break;
+    }
+}
 
+int main(int argc, char* argv[]) {
     // Initialize logging and crash handlers as early as possible
     Logger::Init(L"MinimalImageViewer");
     Logger::InstallCrashHandlers();
-    Logger::Info("Application starting (pid=%lu)", GetCurrentProcessId());
-    
+    Logger::Info("SDL3 Application starting");
+
 #ifdef HAVE_DATADOG
-    // Start root application span
     auto appSpan = Logger::CreateSpan("application.startup");
-    appSpan.set_tag("pid", std::to_string(GetCurrentProcessId()));
-    if (lpCmdLine && *lpCmdLine) {
-        // Convert to UTF-8 for tagging
-        int utf8Size = WideCharToMultiByte(CP_UTF8, 0, lpCmdLine, -1, nullptr, 0, nullptr, nullptr);
-        if (utf8Size > 0) {
-            std::vector<char> utf8Buf(utf8Size);
-            WideCharToMultiByte(CP_UTF8, 0, lpCmdLine, -1, utf8Buf.data(), utf8Size, nullptr, nullptr);
-            appSpan.set_tag("command_line", std::string(utf8Buf.data()));
-        }
-    }
+    appSpan.set_tag("sdl_version", "3");
 #endif
 
-    try {
-
-    auto singleInstanceSpan = Logger::CreateChildSpan(appSpan, "check_single_instance");
-    HWND existingWnd = FindWindowW(L"MinimalImageViewer", nullptr);
-    if (existingWnd) {
-        singleInstanceSpan.set_tag("existing_instance_found", "true");
-        SetForegroundWindow(existingWnd);
-        if (IsIconic(existingWnd)) {
-            ShowWindow(existingWnd, SW_RESTORE);
-        }
-        if (lpCmdLine && *lpCmdLine) {
-            COPYDATASTRUCT cds{};
-            cds.dwData = 1;
-            cds.cbData = (static_cast<DWORD>(wcslen(lpCmdLine)) + 1) * sizeof(wchar_t);
-            cds.lpData = lpCmdLine;
-            SendMessage(existingWnd, WM_COPYDATA, reinterpret_cast<WPARAM>(hInstance), reinterpret_cast<LPARAM>(&cds));
-        }
-        // spans are finished automatically when they go out of scope
-        return 0;
-    }
-    singleInstanceSpan.set_tag("existing_instance_found", "false");
-
-    g_ctx.hInst = hInstance;
-
-    auto comInitSpan = Logger::CreateChildSpan(appSpan, "com_initialize");
-    if (FAILED(CoInitialize(nullptr))) {
-        comInitSpan.set_tag("success", "false");
-        MessageBoxW(nullptr, L"Failed to initialize COM.", L"Error", MB_OK | MB_ICONERROR);
-        return 1;
-    }
-    comInitSpan.set_tag("success", "true");
-
-    // Initialize OpenColorIO with proper fallback config
-    auto ocioInitSpan = Logger::CreateChildSpan(appSpan, "ocio_initialize");
-    try {
-        // Try to get current config
-        g_ctx.ocioConfig = OCIO::GetCurrentConfig();
-
-        // If we got a config, validate it has basic color spaces
-        if (g_ctx.ocioConfig) {
-            bool hasBasicSpaces = false;
-            try {
-                int numSpaces = g_ctx.ocioConfig->getNumColorSpaces();
-                if (numSpaces > 0) {
-                    hasBasicSpaces = true;
-                }
-            } catch (...) {
-                hasBasicSpaces = false;
-            }
-
-            // If config is invalid, fall back to raw
-            if (!hasBasicSpaces) {
-                g_ctx.ocioConfig = OCIO::Config::CreateRaw();
-            }
-        }
-    } catch (const OCIO::Exception& e) {
-        // Fall back to raw config on any failure
-        try {
-            g_ctx.ocioConfig = OCIO::Config::CreateRaw();
-        } catch (const OCIO::Exception& e2) {
-            g_ctx.ocioConfig = nullptr;
-        }
-    } catch (...) {
-        // Ultimate fallback
-        try {
-            g_ctx.ocioConfig = OCIO::Config::CreateRaw();
-        } catch (...) {
-            g_ctx.ocioConfig = nullptr;
-        }
-    }
-
-    // Determine whether OCIO is enabled by environment
-    bool envHasOCIO = false;
-    {
-        // Check Windows wide-character environment variable
-        const wchar_t* ocioEnv = _wgetenv(L"OCIO");
-        envHasOCIO = (ocioEnv && *ocioEnv);
-    }
-    g_ctx.ocioEnabled = envHasOCIO && static_cast<bool>(g_ctx.ocioConfig);
+    // Create splash screen window first
+    SDL_Window* splashWindow = nullptr;
+    SDL_Renderer* splashRenderer = nullptr;
+    TextRenderer* tr = nullptr;  // Global scope for entire splash sequence
     
-    ocioInitSpan.set_tag("enabled", g_ctx.ocioEnabled ? "true" : "false");
-    ocioInitSpan.set_tag("env_has_ocio", envHasOCIO ? "true" : "false");
-    ocioInitSpan.set_tag("has_config", static_cast<bool>(g_ctx.ocioConfig) ? "true" : "false");
-
-    if (!g_ctx.ocioEnabled) {
-        OutputDebugStringA("[OpenColorIO Info]: Color management disabled. (Specify the $OCIO environment variable to enable.)\n");
-        Logger::Info("OpenColorIO: disabled (no $OCIO or no config)");
-    } else {
-        Logger::Info("OpenColorIO: enabled");
-    }
-
-    // Initialize display device
-    g_ctx.displayDevice = "sRGB";
-
-    // Don't create display transform at startup - do it when needed
-    g_ctx.currentDisplayTransform = nullptr;
-
-    // ── Startup splash (boot sequence) ──
-    auto splashSpan = Logger::CreateChildSpan(appSpan, "splash_screen");
-    HWND splash = CreateSplashWindow(hInstance);
-    if (g_ctx.ocioEnabled) {
-        DrawSplashMessage(splash, L"Starting Minimal Image Viewer...", L"OpenColorIO: enabled");
-    } else {
-        DrawSplashMessage(splash, L"Starting Minimal Image Viewer...", L"OpenColorIO: disabled (set $OCIO to enable)");
-    }
-    PumpSplashMessages(splash);
-    // splash span finishes automatically
-
-    WNDCLASSEXW wcex{};
-    wcex.cbSize = sizeof(WNDCLASSEXW);
-    wcex.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
-    wcex.lpfnWndProc = WndProc;
-    wcex.hInstance = hInstance;
-    wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APPICON));
-    wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wcex.hbrBackground = CreateSolidBrush(RGB(0, 0, 0));
-    wcex.lpszClassName = L"MinimalImageViewer";
-    RegisterClassExW(&wcex);
-
-    g_ctx.hWnd = CreateWindowW(
-        wcex.lpszClassName,
-        L"Minimal Image Viewer",
-        WS_POPUP, // hidden until Vulkan is ready so the splash stays visible
-        CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
-        nullptr, nullptr, hInstance, nullptr
-    );
-
-    if (!g_ctx.hWnd) {
-        MessageBoxW(nullptr, L"Failed to create window.", L"Error", MB_OK | MB_ICONERROR);
-        return 1;
-    }
-
-    SetWindowLongPtr(g_ctx.hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&g_ctx));
-
-    // Initialize Vulkan renderer (accurate progress on splash)
-    auto vulkanInitSpan = Logger::CreateChildSpan(appSpan, "vulkan_initialize");
-    DrawSplashProgress(splash, 0, L"Preparing to initialize Vulkan...");
-    PumpSplashMessages(splash);
-
-    static HWND s_splash = nullptr;
-    s_splash = splash;
-    auto progressCb = [](int pct, const wchar_t* stage) {
-        DrawSplashProgress(s_splash, pct, stage);
-        PumpSplashMessages(s_splash);
-        Logger::Info("Vulkan init: %d%% - %s", pct, stage ? "stage" : "");
-        if (stage) {
-            Logger::InfoW(L"Vulkan stage: %s", stage);
+    // Helper lambda to update splash screen with text and progress
+    auto updateSplash = [&](const std::string& status, int progressWidth) {
+        if (splashRenderer && tr) {
+            SDL_Surface* textSurface = tr->CreateSplashScreenSurface(400, 300, status);
+            if (textSurface) {
+                SDL_Texture* textTexture = SDL_CreateTextureFromSurface(splashRenderer, textSurface);
+                if (textTexture) {
+                    SDL_SetRenderDrawBlendMode(splashRenderer, SDL_BLENDMODE_BLEND);
+                    SDL_RenderClear(splashRenderer);
+                    SDL_RenderTexture(splashRenderer, textTexture, nullptr, nullptr);
+                    
+                    // Draw progress bar
+                    SDL_SetRenderDrawColor(splashRenderer, 0, 150, 200, 255);
+                    SDL_FRect progress = {50, 220, static_cast<float>(progressWidth), 20};
+                    SDL_RenderFillRect(splashRenderer, &progress);
+                    
+                    SDL_RenderPresent(splashRenderer);
+                    SDL_DestroyTexture(textTexture);
+                }
+                SDL_DestroySurface(textSurface);
+            }
         }
     };
-
-    g_ctx.renderer = std::make_unique<VulkanRenderer>();
-    if (!g_ctx.renderer->InitializeWithProgress(g_ctx.hWnd, progressCb)) {
-        if (splash) DestroyWindow(splash), splash = nullptr;
-        vulkanInitSpan.set_tag("success", "false");
-        Logger::Error("Failed to initialize Vulkan renderer");
-        MessageBoxW(nullptr, L"Failed to initialize Vulkan renderer.", L"Error", MB_OK | MB_ICONERROR);
-        Logger::Shutdown();
-        return 1;
-    }
-    vulkanInitSpan.set_tag("success", "true");
-
-    // Close splash and show the main window only after Vulkan is ready
-    if (splash) { DestroyWindow(splash); splash = nullptr; }
-
-    DragAcceptFiles(g_ctx.hWnd, TRUE);
-
-    ShowWindow(g_ctx.hWnd, nCmdShow);
-    UpdateWindow(g_ctx.hWnd);
-
-    auto cmdLineSpan = Logger::CreateChildSpan(appSpan, "process_command_line");
-    int argc = 0;
-    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    if (argv && argc > 1) {
-        cmdLineSpan.set_tag("has_file_argument", "true");
-        LoadImageFromFile(argv[1]);
-        GetImagesInDirectory(argv[1]);
-    } else {
-        cmdLineSpan.set_tag("has_file_argument", "false");
-    }
-    if (argv) {
-        LocalFree(argv);
-    }
-    // spans finish automatically when they go out of scope
-
-    // Initialize FPS timer baseline
-    g_ctx.fpsLastTimeMS = GetTickCount64();
-
-    // Non-blocking loop to drive continuous rendering and FPS updates
-    MSG msg{};
-    for (;;) {
-        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) {
-                auto shutdownSpan = Logger::CreateSpan("application.shutdown");
-                Logger::Info("WM_QUIT received, shutting down");
-                Logger::Shutdown();
-                CoUninitialize();
-                return static_cast<int>(msg.wParam);
-            }
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
+    
+    try {
+        // Initialize SDL3
+        std::cout << "[INIT] Initializing SDL3..." << std::endl;
+        if (!SDL_Init(SDL_INIT_VIDEO)) {
+            Logger::Error("SDL_Init failed: %s", SDL_GetError());
+            return 1;
         }
-
-        // Request a repaint to drive rendering
-        InvalidateRect(g_ctx.hWnd, nullptr, FALSE);
-
-        // FPS accounting
-        ++g_ctx.fpsFrameCount;
-        unsigned long long now = GetTickCount64();
-        unsigned long long elapsed = now - g_ctx.fpsLastTimeMS;
-        if (elapsed >= 1000ULL) {
-            g_ctx.fps = static_cast<float>(g_ctx.fpsFrameCount) * 1000.0f / static_cast<float>(elapsed);
-            g_ctx.fpsFrameCount = 0;
-            g_ctx.fpsLastTimeMS = now;
-
-            if (g_ctx.showFps) {
-                wchar_t title[256];
-                swprintf(title, 256, L"Minimal Image Viewer - %.1f FPS", g_ctx.fps);
-                SetWindowTextW(g_ctx.hWnd, title);
-            }
-        }
-
-        // Handle deferred renderer reset outside paint/draw for safety
-        if (g_ctx.rendererNeedsReset) {
-            auto resetSpan = Logger::CreateSpan("renderer.reset");
-            // Ensure no frame is currently issuing Vulkan work
-            while (g_ctx.renderInProgress.load(std::memory_order_acquire)) {
-                Sleep(0); // yield until current render completes
-            }
-
-            // Exclusive lock ensures no new rendering uses stale Vulkan handles during recovery
-            AcquireSRWLockExclusive(&g_ctx.renderLock);
-
-            const bool deviceLost = (g_ctx.renderer && g_ctx.renderer->IsDeviceLost());
-            resetSpan.set_tag("device_lost", deviceLost ? "true" : "false");
-            if (g_ctx.renderer && deviceLost) {
-                resetSpan.set_tag("reset_type", "full_rebuild");
-                Logger::Warn("Reset: device lost detected — performing full renderer rebuild");
-                // Full teardown and reinit
-                g_ctx.renderer->Shutdown();
-                g_ctx.renderer.reset();
-                g_ctx.renderer = std::make_unique<VulkanRenderer>();
-                if (!g_ctx.renderer->Initialize(g_ctx.hWnd)) {
-                    resetSpan.set_tag("success", "false");
-                    Logger::Error("Reset: VulkanRenderer re-initialization FAILED after device lost");
-                    g_ctx.renderer.reset();
+        std::cout << "[INIT] SDL3 initialized successfully" << std::endl;
+        
+        // Create splash screen
+        splashWindow = SDL_CreateWindow("Minimal Image Viewer - Initializing...", 
+                                       400, 300, SDL_WINDOW_BORDERLESS);
+        if (splashWindow) {
+            SDL_SetWindowPosition(splashWindow, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+            splashRenderer = SDL_CreateRenderer(splashWindow, nullptr);
+            
+            if (splashRenderer) {
+                // Initialize TextRenderer for splash screen - single instance for all splash updates
+                tr = new TextRenderer();
+                if (tr->Initialize()) {
+                    // Create splash screen surface with text
+                    SDL_Surface* textSurface = tr->CreateSplashScreenSurface(400, 300, "Initializing...");
+                    if (textSurface) {
+                        SDL_Texture* textTexture = SDL_CreateTextureFromSurface(splashRenderer, textSurface);
+                        if (textTexture) {
+                            SDL_SetRenderDrawBlendMode(splashRenderer, SDL_BLENDMODE_BLEND);
+                            SDL_RenderClear(splashRenderer);
+                            SDL_RenderTexture(splashRenderer, textTexture, nullptr, nullptr);
+                            
+                            // Draw initial progress bar (0%)
+                            SDL_SetRenderDrawColor(splashRenderer, 0, 150, 200, 255);
+                            SDL_FRect progress = {50, 220, 0, 20};
+                            SDL_RenderFillRect(splashRenderer, &progress);
+                            
+                            SDL_RenderPresent(splashRenderer);
+                            SDL_DestroyTexture(textTexture);
+                        }
+                        SDL_DestroySurface(textSurface);
+                    }
                 } else {
-                    resetSpan.set_tag("success", "true");
-                    Logger::Info("Reset: VulkanRenderer re-initialized after device lost");
+                    Logger::Warn("TextRenderer init failed; showing splash without text");
+                    // Fallback to simple rectangles
+                    SDL_SetRenderDrawColor(splashRenderer, 30, 30, 30, 255);
+                    SDL_RenderClear(splashRenderer);
+                    SDL_SetRenderDrawColor(splashRenderer, 70, 70, 70, 255);
+                    SDL_FRect titleRect = {0, 0, 400, 80};
+                    SDL_RenderFillRect(splashRenderer, &titleRect);
+                    SDL_RenderPresent(splashRenderer);
+                    delete tr;
+                    tr = nullptr;
                 }
-            } else if (g_ctx.renderer) {
-                // Swapchain-only path (e.g., out-of-date)
-                RECT cr{};
-                GetClientRect(g_ctx.hWnd, &cr);
-                uint32_t w = static_cast<uint32_t>(std::max<LONG>(1, cr.right - cr.left));
-                uint32_t h = static_cast<uint32_t>(std::max<LONG>(1, cr.bottom - cr.top));
-                resetSpan.set_tag("reset_type", "swapchain_only");
-                resetSpan.set_tag("width", std::to_string(w));
-                resetSpan.set_tag("height", std::to_string(h));
-                Logger::Warn("Reset: swapchain recreation (w={}, h={})", w, h);
-                g_ctx.renderer->Resize(w, h);
-                g_ctx.renderer->ClearErrorFlags();
-                resetSpan.set_tag("success", "true");
-                Logger::Info("Reset: swapchain recreated");
             }
-
-            g_ctx.rendererNeedsReset = false;
-            ReleaseSRWLockExclusive(&g_ctx.renderLock);
         }
 
-        // Small sleep to avoid busy-waiting
-        Sleep(1);
-    }
+        // Update splash: COM initialization (25%)
+        updateSplash("Initializing COM...", 75);
+        
+        // Initialize COM for Windows file operations
+#ifdef _WIN32
+        std::cout << "[INIT] Initializing COM for Windows file operations..." << std::endl;
+        if (FAILED(CoInitialize(nullptr))) {
+            Logger::Error("Failed to initialize COM");
+            if (splashRenderer) SDL_DestroyRenderer(splashRenderer);
+            if (splashWindow) SDL_DestroyWindow(splashWindow);
+            SDL_Quit();
+            return 1;
+        }
+        std::cout << "[INIT] COM initialized successfully" << std::endl;
+#endif
+
+        // Update splash: OpenColorIO initialization (50%)
+        updateSplash("Initializing OpenColorIO...", 150);
+        
+        // Initialize OpenColorIO
+        std::cout << "[INIT] Initializing OpenColorIO..." << std::endl;
+        try {
+            g_ctx.ocioConfig = OCIO::GetCurrentConfig();
+            if (g_ctx.ocioConfig) {
+                bool hasBasicSpaces = false;
+                try {
+                    int numSpaces = g_ctx.ocioConfig->getNumColorSpaces();
+                    hasBasicSpaces = (numSpaces > 0);
+                } catch (...) {
+                    hasBasicSpaces = false;
+                }
+                if (!hasBasicSpaces) {
+                    g_ctx.ocioConfig = OCIO::Config::CreateRaw();
+                }
+            }
+        } catch (const OCIO::Exception& e) {
+            try {
+                g_ctx.ocioConfig = OCIO::Config::CreateRaw();
+            } catch (...) {
+                g_ctx.ocioConfig = nullptr;
+            }
+        } catch (...) {
+            try {
+                g_ctx.ocioConfig = OCIO::Config::CreateRaw();
+            } catch (...) {
+                g_ctx.ocioConfig = nullptr;
+            }
+        }
+
+        // Check OCIO environment
+        const char* ocioEnv = SDL_getenv("OCIO");
+        g_ctx.ocioEnabled = (ocioEnv && *ocioEnv && g_ctx.ocioConfig);
+        g_ctx.displayDevice = "sRGB";
+
+        if (!g_ctx.ocioEnabled) {
+            Logger::Info("OpenColorIO: disabled (no $OCIO or no config)");
+            std::cout << "[INIT] OpenColorIO: disabled (no $OCIO environment variable or config)" << std::endl;
+        } else {
+            Logger::Info("OpenColorIO: enabled");
+            std::cout << "[INIT] OpenColorIO: enabled with color management" << std::endl;
+        }
+
+        // Update splash: Creating main window (75%)
+        updateSplash("Creating main window...", 225);
+        
+        // Create SDL window
+        std::cout << "[INIT] Creating main application window..." << std::endl;
+        g_ctx.window = SDL_CreateWindow("Minimal Image Viewer", 1280, 720, 
+                                       SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
+        if (!g_ctx.window) {
+            Logger::Error("SDL_CreateWindow failed: %s", SDL_GetError());
+            if (splashRenderer) SDL_DestroyRenderer(splashRenderer);
+            if (splashWindow) SDL_DestroyWindow(splashWindow);
+            SDL_Quit();
+            return 1;
+        }
+        std::cout << "[INIT] Main window created successfully" << std::endl;
+
+        // Initialize synchronization
+        g_ctx.renderLock = SDL_CreateMutex();
+        if (!g_ctx.renderLock) {
+            Logger::Error("Failed to create render mutex");
+            SDL_DestroyWindow(g_ctx.window);
+            SDL_Quit();
+            return 1;
+        }
+
+        // Update splash: Vulkan initialization (93%)
+        updateSplash("Initializing Vulkan...", 280);
+        
+        // Initialize Vulkan renderer
+        std::cout << "[INIT] Initializing Vulkan renderer..." << std::endl;
+        Logger::Info("Initializing Vulkan renderer...");
+        g_ctx.renderer = std::make_unique<VulkanRenderer>();
+        if (!g_ctx.renderer->Initialize(g_ctx.window)) {
+            Logger::Error("Failed to initialize Vulkan renderer");
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", 
+                                   "Failed to initialize Vulkan renderer.", g_ctx.window);
+            if (splashRenderer) SDL_DestroyRenderer(splashRenderer);
+            if (splashWindow) SDL_DestroyWindow(splashWindow);
+            SDL_DestroyMutex(g_ctx.renderLock);
+            SDL_DestroyWindow(g_ctx.window);
+            SDL_Quit();
+            return 1;
+        }
+
+        Logger::Info("Vulkan renderer initialized successfully");
+        std::cout << "[INIT] Vulkan renderer initialized successfully" << std::endl;
+
+        // Finalize splash: Complete initialization (100%)
+        if (splashRenderer && tr) {
+            SDL_Surface* textSurface = tr->CreateSplashScreenSurface(400, 300, "Ready!");
+            if (textSurface) {
+                SDL_Texture* textTexture = SDL_CreateTextureFromSurface(splashRenderer, textSurface);
+                if (textTexture) {
+                    SDL_SetRenderDrawBlendMode(splashRenderer, SDL_BLENDMODE_BLEND);
+                    SDL_RenderClear(splashRenderer);
+                    SDL_RenderTexture(splashRenderer, textTexture, nullptr, nullptr);
+                    
+                    // Draw complete progress bar (100%) - green for complete
+                    SDL_SetRenderDrawColor(splashRenderer, 0, 200, 100, 255);
+                    SDL_FRect progress = {50, 220, 300, 20};
+                    SDL_RenderFillRect(splashRenderer, &progress);
+                    
+                    SDL_RenderPresent(splashRenderer);
+                    SDL_DestroyTexture(textTexture);
+                }
+                SDL_DestroySurface(textSurface);
+            }
+        }
+        
+        // Brief pause to show completion
+        SDL_Delay(500);
+        
+        // Clean up TextRenderer before destroying splash window
+        if (tr) {
+            Logger::Info("Cleaning up splash TextRenderer...");
+            tr->Shutdown();  // Explicit shutdown before delete
+            delete tr;
+            tr = nullptr;
+            Logger::Info("Splash TextRenderer cleaned up successfully");
+        }
+        
+        // Clean up splash screen
+        if (splashRenderer) {
+            SDL_DestroyRenderer(splashRenderer);
+            splashRenderer = nullptr;
+        }
+        if (splashWindow) {
+            SDL_DestroyWindow(splashWindow);
+            splashWindow = nullptr;
+        }
+        
+        std::cout << "[INIT] Initialization complete - starting main application" << std::endl;
+        
+        // Process command line arguments
+        if (argc > 1) {
+            std::cout << "[INIT] Loading image from command line: " << argv[1] << std::endl;
+            LoadImageFromFile(argv[1]);
+            GetImagesInDirectory(argv[1]);
+        }
+
+        // Initialize FPS timer
+        g_ctx.fpsLastTimeMS = SDL_GetTicks();
+
+        // Main event loop
+        bool running = true;
+        std::vector<std::string> pendingDrops;
+
+        SDL_Event event;
+        while (running) {
+            while (SDL_PollEvent(&event)) {
+                switch (event.type) {
+                    case SDL_EVENT_QUIT:
+                        running = false;
+                        break;
+
+                    case SDL_EVENT_DROP_BEGIN:
+                        pendingDrops.clear();
+                        break;
+
+                    case SDL_EVENT_DROP_FILE:
+                        if (event.drop.data) {
+                            pendingDrops.emplace_back(event.drop.data);
+                            Logger::Info("Dropped file: %s at (%.1f, %.1f)", 
+                                       event.drop.data, event.drop.x, event.drop.y);
+                        }
+                        break;
+
+                    case SDL_EVENT_DROP_COMPLETE:
+                        for (const auto& path : pendingDrops) {
+                            Logger::Info("Processing dropped file: %s", path.c_str());
+                            LoadImageFromFile(path.c_str());
+                            GetImagesInDirectory(path.c_str());
+                            break; // Only load the first file for now
+                        }
+                        pendingDrops.clear();
+                        break;
+
+                    default:
+                        HandleSDLEvent(event);
+                        break;
+                }
+            }
+
+            // FPS accounting
+            ++g_ctx.fpsFrameCount;
+            uint64_t now = SDL_GetTicks();
+            uint64_t elapsed = now - g_ctx.fpsLastTimeMS;
+            if (elapsed >= 1000) {
+                g_ctx.fps = static_cast<float>(g_ctx.fpsFrameCount) * 1000.0f / static_cast<float>(elapsed);
+                g_ctx.fpsFrameCount = 0;
+                g_ctx.fpsLastTimeMS = now;
+
+                if (g_ctx.showFps) {
+                    std::string title = "Minimal Image Viewer - " + std::to_string(g_ctx.fps) + " FPS";
+                    SDL_SetWindowTitle(g_ctx.window, title.c_str());
+                }
+            }
+
+            // Handle renderer reset
+            if (g_ctx.rendererNeedsReset) {
+                while (g_ctx.renderInProgress.load(std::memory_order_acquire)) {
+                    SDL_Delay(0);
+                }
+
+                SDL_LockMutex(g_ctx.renderLock);
+
+                const bool deviceLost = (g_ctx.renderer && g_ctx.renderer->IsDeviceLost());
+                if (g_ctx.renderer && deviceLost) {
+                    Logger::Warn("Reset: device lost detected — performing full renderer rebuild");
+                    g_ctx.renderer->Shutdown();
+                    g_ctx.renderer.reset();
+                    g_ctx.renderer = std::make_unique<VulkanRenderer>();
+                    if (!g_ctx.renderer->Initialize(g_ctx.window)) {
+                        Logger::Error("Reset: VulkanRenderer re-initialization FAILED after device lost");
+                        g_ctx.renderer.reset();
+                    } else {
+                        Logger::Info("Reset: VulkanRenderer re-initialized after device lost");
+                    }
+                } else if (g_ctx.renderer) {
+                    int w, h;
+                    SDL_GetWindowSize(g_ctx.window, &w, &h);
+                    Logger::Warn("Reset: swapchain recreation (w={}, h={})", w, h);
+                    g_ctx.renderer->Resize(static_cast<uint32_t>(w), static_cast<uint32_t>(h));
+                    g_ctx.renderer->ClearErrorFlags();
+                    Logger::Info("Reset: swapchain recreated");
+                }
+
+                g_ctx.rendererNeedsReset = false;
+                SDL_UnlockMutex(g_ctx.renderLock);
+            }
+
+            // Render frame
+            if (g_ctx.renderer) {
+                DrawImage(); // This will be implemented in image_drawing.cpp
+            }
+
+            SDL_Delay(1);
+        }
+
     } catch (const std::exception& e) {
         Logger::Error("Unhandled std::exception: %s", e.what());
         Logger::LogStackTrace();
         Logger::DumpNow("Unhandled std::exception");
-        Logger::Shutdown();
-        return 1;
     } catch (...) {
         Logger::Error("Unhandled unknown exception");
         Logger::LogStackTrace();
         Logger::DumpNow("Unhandled unknown exception");
-        Logger::Shutdown();
-        return 1;
     }
+
+    // Cleanup - VERY IMPORTANT: Clean up in reverse order of initialization
+    Logger::Info("Shutting down application");
+    
+    // 1. Clean up any remaining TextRenderer instances first (before SDL shutdown)
+    if (tr) {
+        Logger::Info("Emergency cleanup of splash TextRenderer...");
+        tr->Shutdown();
+        delete tr;
+        tr = nullptr;
+    }
+    
+    // 2. Shutdown Vulkan renderer
+    if (g_ctx.renderer) {
+        Logger::Info("Shutting down Vulkan renderer...");
+        g_ctx.renderer->Shutdown();
+        g_ctx.renderer.reset();
+        Logger::Info("Vulkan renderer shut down");
+    }
+    
+    // 3. Destroy mutex
+    if (g_ctx.renderLock) {
+        Logger::Info("Destroying render mutex...");
+        SDL_DestroyMutex(g_ctx.renderLock);
+        g_ctx.renderLock = nullptr;
+        Logger::Info("Render mutex destroyed");
+    }
+    
+    // 4. Destroy main window
+    if (g_ctx.window) {
+        Logger::Info("Destroying main window...");
+        SDL_DestroyWindow(g_ctx.window);
+        g_ctx.window = nullptr;
+        Logger::Info("Main window destroyed");
+    }
+    
+    // 5. Uninitialize COM before SDL
+#ifdef _WIN32
+    Logger::Info("Uninitializing COM...");
+    CoUninitialize();
+    Logger::Info("COM uninitialized");
+#endif
+    
+    // 6. Quit SDL last
+    Logger::Info("Shutting down SDL...");
+    SDL_Quit();
+    Logger::Info("SDL shut down successfully");
+    
+    // 7. Logger shutdown last
+    Logger::Shutdown();
+    
+    return 0;
 }

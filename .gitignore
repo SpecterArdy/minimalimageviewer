@@ -43,3 +43,5 @@
 /.sonarlint
 /.PVS-Studio
 /.aiassistant
+/doc
+/third_party

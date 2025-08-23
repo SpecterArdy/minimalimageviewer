@@ -141,6 +141,8 @@ endif()
 
 # ── Dependencies ────────────────────────────────────────────────────────────
 find_package(Vulkan REQUIRED)
+find_package(SDL3 CONFIG REQUIRED)
+find_package(SDL3_ttf CONFIG REQUIRED)
 find_package(OpenImageIO CONFIG REQUIRED)
 # Keep OpenColorIO enabled; we will bundle its DLLs post-build
 find_package(OpenColorIO CONFIG REQUIRED)
@@ -152,9 +154,11 @@ add_executable(minimalimageviewer WIN32
         src/image_drawing.cpp
         src/image_io.cpp
         src/vulkan_renderer.cpp
+        src/text_renderer.cpp
         src/logging.cpp
         src/viewer.cpp
         src/vulkan_renderer.h
+        src/text_renderer.h
         src/viewer.h
         src/logging.h
         src/resource.h
@@ -167,6 +171,10 @@ else()
     target_include_directories(minimalimageviewer PRIVATE ${Vulkan_INCLUDE_DIRS})
     target_link_libraries(minimalimageviewer PRIVATE ${Vulkan_LIBRARIES})
 endif()
+
+# Link SDL3 and SDL3_ttf
+target_link_libraries(minimalimageviewer PRIVATE SDL3::SDL3)
+target_link_libraries(minimalimageviewer PRIVATE SDL3_ttf::SDL3_ttf)
 
 # Link OpenImageIO (required)
 target_link_libraries(minimalimageviewer PRIVATE OpenImageIO::OpenImageIO)

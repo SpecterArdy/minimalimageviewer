@@ -1,17 +1,17 @@
 #pragma once
 
-#include <windows.h>
-#include <commdlg.h>
-#include <shlwapi.h>
-#include <shellapi.h>
-#include <propvarutil.h>
-#include <shlobj.h>
+#include <SDL3/SDL.h>
 #include <vector>
 #include <string>
 #include <algorithm>
 #include <cmath>
 #include <memory>
 #include <atomic>
+
+#ifdef _WIN32
+#include <windows.h>
+// Other Windows headers are included in specific implementation files as needed
+#endif
 
 #include "resource.h"
 
@@ -63,8 +63,7 @@ struct ImageData {
 };
 
 struct AppContext {
-    HINSTANCE hInst = nullptr;
-    HWND hWnd = nullptr;
+    SDL_Window* window = nullptr;
     ImageData imageData;
 
     std::vector<std::wstring> imageFiles;
@@ -76,8 +75,8 @@ struct AppContext {
     float offsetY = 0.0f;
 
     bool isFullScreen = false;
-    LONG savedStyle = 0;
-    RECT savedRect{};
+    SDL_Rect savedWindowRect{};
+    bool savedMaximized = false;
 
     // Vulkan renderer (initialized after window creation)
     std::unique_ptr<VulkanRenderer> renderer;
@@ -94,15 +93,15 @@ struct AppContext {
 
     // FPS counter
     bool showFps = true;
-    unsigned long long fpsLastTimeMS = 0;
+    uint64_t fpsLastTimeMS = 0;
     int fpsFrameCount = 0;
     float fps = 0.0f;
 
     // Renderer maintenance
     bool rendererNeedsReset = false;
 
-    // Synchronization: reader-writer lock for safe renderer access/reset
-    SRWLOCK renderLock = SRWLOCK_INIT;
+    // Synchronization: simple mutex instead of SRWLOCK for cross-platform compatibility
+    SDL_Mutex* renderLock = nullptr;
 
     // Tracks whether a render is currently issuing Vulkan commands
     std::atomic<bool> renderInProgress{false};
@@ -124,9 +123,14 @@ struct AppContext {
 
 // main.cpp
 void CenterImage(bool resetZoom);
+void HandleSDLEvent(const SDL_Event& event);
 
 // ui_handlers.cpp  
-LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+void HandleKeyboardEvent(const SDL_KeyboardEvent& event);
+void HandleMouseEvent(const SDL_MouseButtonEvent& event);
+void HandleMouseMotion(const SDL_MouseMotionEvent& event);
+void HandleMouseWheel(const SDL_MouseWheelEvent& event);
+void ShowContextMenu(int x, int y);
 
 // Forward declaration for functions that might be missing
 void FitImageToWindow();
@@ -135,18 +139,20 @@ void RotateImage(bool clockwise);
 
 // image_io.cpp
 void LoadImageFromFile(const wchar_t* filePath);
+void LoadImageFromFile(const char* filePath);
 void GetImagesInDirectory(const wchar_t* filePath);
+void GetImagesInDirectory(const char* filePath);
 void SaveImage();
 void SaveImageAs();
 void DeleteCurrentImage();
-void HandleDropFiles(HDROP hDrop);
+void HandleDropFiles(const std::vector<std::string>& filePaths);
 void HandlePaste();
 void HandleCopy();
 void OpenFileLocationAction();
 
 // image_drawing.cpp
-void DrawImage(HDC hdc, const RECT& clientRect, const AppContext& ctx);
+void DrawImage();
 void FitImageToWindow();
 void ZoomImage(float factor);
 void RotateImage(bool clockwise);
-bool IsPointInImage(POINT pt, const RECT& clientRect);
+bool IsPointInImage(int x, int y);

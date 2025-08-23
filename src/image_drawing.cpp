@@ -73,13 +73,13 @@ static HFONT CreateMessageFontForDpi(HWND hwnd) {
         return cap;
     }
 
-    // RAII guard for SRWLOCK shared (reader) access
-    struct SrwSharedGuard {
-        SRWLOCK* lock;
-        explicit SrwSharedGuard(SRWLOCK* l) : lock(l) { AcquireSRWLockShared(lock); }
-        ~SrwSharedGuard() { ReleaseSRWLockShared(lock); }
-        SrwSharedGuard(const SrwSharedGuard&) = delete;
-        SrwSharedGuard& operator=(const SrwSharedGuard&) = delete;
+    // RAII guard for SDL mutex shared access
+    struct MutexSharedGuard {
+        SDL_Mutex* lock;
+        explicit MutexSharedGuard(SDL_Mutex* l) : lock(l) { SDL_LockMutex(lock); }
+        ~MutexSharedGuard() { SDL_UnlockMutex(lock); }
+        MutexSharedGuard(const MutexSharedGuard&) = delete;
+        MutexSharedGuard& operator=(const MutexSharedGuard&) = delete;
     };
 
     // RAII guard to mark rendering as active
@@ -103,7 +103,7 @@ void DrawImage(HDC hdc, const RECT& clientRect, const AppContext& ctx) {
     drawSpan.set_tag("offset_y", std::to_string(g_ctx.offsetY));
 #endif
     
-    SrwSharedGuard guard(&g_ctx.renderLock);
+    MutexSharedGuard guard(g_ctx.renderLock);
     RenderInProgressGuard rip(g_ctx.renderInProgress);
 
     int clientWidth = clientRect.right - clientRect.left;
@@ -142,7 +142,14 @@ void DrawImage(HDC hdc, const RECT& clientRect, const AppContext& ctx) {
                 : L"[OpenColorIO Info]: Color management disabled. (Set $OCIO to enable.)";
             const wchar_t* help  = L"Shortcuts: Ctrl+Wheel/+/– to zoom, Ctrl+0 to fit, Right-click for menu.";
 
-            HFONT font = CreateMessageFontForDpi(g_ctx.hWnd);
+#ifdef _WIN32
+            SDL_PropertiesID props = SDL_GetWindowProperties(g_ctx.window);
+            HWND hwnd = (HWND)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+            HFONT font = CreateMessageFontForDpi(hwnd);
+#else
+            // On non-Windows platforms, use a default font approach
+            HFONT font = nullptr;
+#endif
             HFONT old = (HFONT)SelectObject(hdc, font);
 
             RECT r = clientRect;
@@ -186,14 +193,11 @@ void DrawImage(HDC hdc, const RECT& clientRect, const AppContext& ctx) {
         // Re-upload texture ONLY when image data changes. Zoom now affects rendering only.
         static uint32_t s_lastImageWidth = 0;
         static uint32_t s_lastImageHeight = 0;
-        static float s_lastZoom = -1.0f;
         static bool s_lastIsHdr = false;
 
         const bool imageChanged = (ctx.imageData.width != s_lastImageWidth || 
                                   ctx.imageData.height != s_lastImageHeight ||
                                   ctx.imageData.isHdr != s_lastIsHdr);
-        const float zoomDelta = (s_lastZoom < 0.0f) ? 1.0f : std::fabs(ctx.zoomFactor - s_lastZoom);
-        const bool zoomChangedSignificantly = (zoomDelta >= 0.05f);
 
         if (imageChanged) {
             const void* pixelData = ctx.imageData.pixels.data();
@@ -204,7 +208,6 @@ void DrawImage(HDC hdc, const RECT& clientRect, const AppContext& ctx) {
             s_lastImageWidth = ctx.imageData.width;
             s_lastImageHeight = ctx.imageData.height;
             s_lastIsHdr = ctx.imageData.isHdr;
-            s_lastZoom = ctx.zoomFactor;
         }
 
         // Compute dynamic cap for current orientation
@@ -252,7 +255,6 @@ void DrawImage(HDC hdc, const RECT& clientRect, const AppContext& ctx) {
             g_ctx.rendererNeedsReset = true;
             s_lastImageWidth = 0;
             s_lastImageHeight = 0;
-            s_lastZoom = -1.0f;
         } else {
 #ifdef HAVE_DATADOG
             renderSpan.set_tag("needs_reset", "false");
@@ -275,7 +277,16 @@ void FitImageToWindow() {
     }
 
     RECT clientRect;
-    GetClientRect(g_ctx.hWnd, &clientRect);
+#ifdef _WIN32
+    SDL_PropertiesID props = SDL_GetWindowProperties(g_ctx.window);
+    HWND hwnd = (HWND)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+    GetClientRect(hwnd, &clientRect);
+#else
+    // On non-Windows platforms, get client rect from SDL
+    int w, h;
+    SDL_GetWindowSize(g_ctx.window, &w, &h);
+    clientRect = {0, 0, w, h};
+#endif
     if (IsRectEmpty(&clientRect)) return;
 
     float clientWidth = static_cast<float>(clientRect.right - clientRect.left);
@@ -309,7 +320,7 @@ void FitImageToWindow() {
     fitSpan.set_tag("client_height", std::to_string(clientHeight));
 #endif
     
-    InvalidateRect(g_ctx.hWnd, nullptr, FALSE);
+    // SDL3 will trigger a redraw automatically
 }
 
 void ZoomImage(float factor) {
@@ -378,7 +389,7 @@ void ZoomImage(float factor) {
     zoomSpan.set_tag("zoom_direction", factor > 1.0f ? "in" : "out");
 #endif
     
-    InvalidateRect(g_ctx.hWnd, nullptr, FALSE);
+    // SDL3 will trigger a redraw automatically
 }
 
 void RotateImage(bool clockwise) {
@@ -404,10 +415,10 @@ void RotateImage(bool clockwise) {
     rotateSpan.set_tag("new_angle", std::to_string(g_ctx.rotationAngle));
 #endif
     
-    InvalidateRect(g_ctx.hWnd, nullptr, FALSE);
+    // SDL3 will trigger a redraw automatically
 }
 
-bool IsPointInImage(POINT pt, const RECT& clientRect) {
+bool IsPointInImage(POINT pt, const RECT& /* clientRect */) {
     if (!g_ctx.imageData.isValid()) return false;
 
     // Safety check for zoom factor to prevent division by zero
@@ -415,8 +426,17 @@ bool IsPointInImage(POINT pt, const RECT& clientRect) {
         return false;
     }
 
+#ifdef _WIN32
+    SDL_PropertiesID props = SDL_GetWindowProperties(g_ctx.window);
+    HWND hwnd = (HWND)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
     RECT cr;
-    GetClientRect(g_ctx.hWnd, &cr);
+    GetClientRect(hwnd, &cr);
+#else
+    // On non-Windows platforms, get client rect from SDL
+    int w, h;
+    SDL_GetWindowSize(g_ctx.window, &w, &h);
+    RECT cr = {0, 0, w, h};
+#endif
 
     float windowCenterX = (cr.right - cr.left) / 2.0f;
     float windowCenterY = (cr.bottom - cr.top) / 2.0f;
@@ -455,4 +475,21 @@ bool IsPointInImage(POINT pt, const RECT& clientRect) {
 
     return localX >= 0 && localX < static_cast<float>(g_ctx.imageData.width) && 
            localY >= 0 && localY < static_cast<float>(g_ctx.imageData.height);
+}
+
+// Compatibility functions
+void DrawImage() {
+    // Get client rect from SDL window
+    int w, h;
+    SDL_GetWindowSize(g_ctx.window, &w, &h);
+    RECT clientRect = {0, 0, w, h};
+    
+    // Call the main DrawImage function with null HDC (Vulkan rendering doesn't need it)
+    DrawImage(nullptr, clientRect, g_ctx);
+}
+
+bool IsPointInImage(int x, int y) {
+    POINT pt = {x, y};
+    RECT dummyRect = {0}; // Not used in the function anyway
+    return IsPointInImage(pt, dummyRect);
 }

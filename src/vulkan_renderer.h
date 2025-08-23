@@ -1,12 +1,16 @@
 #pragma once
 
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+
+// Include core Vulkan headers first
+#include <vulkan/vulkan.h>
+#include "text_renderer.h"
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <vulkan/vulkan.h>
 #include <vulkan/vulkan_win32.h>
-#else
-#include <vulkan/vulkan.h>
 #endif
 
 #include <vector>
@@ -32,8 +36,12 @@ public:
     // Optional progress callback: percent in [0,100], and a stage description
     using ProgressCallback = void(*)(int percent, const wchar_t* stage);
 
+    // SDL3 interface
+    bool Initialize(SDL_Window* window);
+    bool InitializeWithProgress(SDL_Window* window, ProgressCallback cb);
+    
+    // Legacy Win32 interface (for compatibility)
     bool Initialize(HWND hwnd);
-    // Progress-enabled initialization (reports fine-grained steps)
     bool InitializeWithProgress(HWND hwnd, ProgressCallback cb);
 
     void Shutdown();
@@ -124,12 +132,17 @@ private:
     std::vector<uint8_t> fallbackBuffer_;
 
     void* colorProcessor_ = nullptr;
+    
+    // Text rendering
+    TextRenderer textRenderer_;
 
     // Helper functions
     bool initInstance();
     bool pickPhysicalDevice();
+    bool initializeTextRenderer();
     bool createDeviceAndQueues();
     bool createSurface(HWND hwnd);
+    bool createSurface(SDL_Window* window);
     bool createCommandPool();
     bool createSwapchain(uint32_t width, uint32_t height);
     void destroySwapchain();
@@ -154,4 +167,7 @@ private:
 
     VkCommandBuffer beginSingleTimeCommands();
     void endSingleTimeCommands(VkCommandBuffer commandBuffer);
+    
+    // UI rendering functions
+    void RenderInstructionalUI(VkCommandBuffer cmd, VkImage swapchainImage, uint32_t width, uint32_t height);
 };

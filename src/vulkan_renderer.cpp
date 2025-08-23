@@ -94,7 +94,7 @@ bool VulkanRenderer::initInstance() {
 
     // Skipping registry probe under MSYS2/MinGW; rely on Vulkan loader presence
 
-    // Create Vulkan instance using the linked loader (MSYS2/MinGW)
+    // Create Vulkan instance using SDL3's extension querying
     VkApplicationInfo app{};
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app.pApplicationName = "MinimalImageViewer";
@@ -103,17 +103,19 @@ bool VulkanRenderer::initInstance() {
     app.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     app.apiVersion = VK_API_VERSION_1_1;
 
-    const char* extensions[] = {
-        VK_KHR_SURFACE_EXTENSION_NAME,
-        VK_KHR_WIN32_SURFACE_EXTENSION_NAME
-    };
+    // Get required extensions from SDL3
+    Uint32 extensionCount = 0;
+    const char* const* extensions = SDL_Vulkan_GetInstanceExtensions(&extensionCount);
+    if (extensions == nullptr || extensionCount == 0) {
+        return false; // Could not get required extensions
+    }
 
     VkInstanceCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ci.pApplicationInfo = &app;
     ci.enabledLayerCount = 0;
     ci.ppEnabledLayerNames = nullptr;
-    ci.enabledExtensionCount = static_cast<uint32_t>(std::size(extensions));
+    ci.enabledExtensionCount = extensionCount;
     ci.ppEnabledExtensionNames = extensions;
 
     VkResult createRes = vkCreateInstance(&ci, nullptr, &instance_);
@@ -172,7 +174,16 @@ bool VulkanRenderer::pickPhysicalDevice() {
             return true;
         }
     }
-    return false;
+    return true;
+}
+
+bool VulkanRenderer::initializeTextRenderer() {
+    // Initialize text rendering system
+    if (!textRenderer_.Initialize()) {
+        Logger::Warn("Failed to initialize text renderer, text overlays will not be available");
+        return false;
+    }
+    return true;
 }
 
 void VulkanRenderer::SetColorTransform(void* processor) {
@@ -238,6 +249,26 @@ bool VulkanRenderer::createSurface(HWND hwnd) {
 
     VkResult createResult = vkCreateWin32SurfaceKHR(instance_, &sci, nullptr, &surface_);
     if (createResult != VK_SUCCESS) {
+        surface_ = VK_NULL_HANDLE;
+        return false;
+    }
+
+    // NASA Standard: Validate surface was created
+    if (surface_ == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    return true;
+}
+
+bool VulkanRenderer::createSurface(SDL_Window* window) {
+    // NASA Standard: Validate all input parameters and state
+    if (window == nullptr || instance_ == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    // Use SDL3 to create the Vulkan surface
+    if (!SDL_Vulkan_CreateSurface(window, instance_, nullptr, &surface_)) {
         surface_ = VK_NULL_HANDLE;
         return false;
     }
@@ -636,6 +667,9 @@ bool VulkanRenderer::Initialize(HWND hwnd) {
         return false;
     }
 
+    // Initialize text renderer for instructional UI
+    initializeTextRenderer();
+
     // NASA Standard: Mark Vulkan as available after successful initialization
     vulkanAvailable_ = true;
     return true;
@@ -742,6 +776,9 @@ void VulkanRenderer::Shutdown() {
     // NASA Standard: Reset all queue handles
     graphicsQueue_ = VK_NULL_HANDLE;
     presentQueue_ = VK_NULL_HANDLE;
+    
+    // Shutdown text renderer
+    textRenderer_.Shutdown();
 }
 
 void VulkanRenderer::Resize(uint32_t width, uint32_t height) {
@@ -1081,6 +1118,8 @@ void VulkanRenderer::Render(uint32_t width, uint32_t height, float zoom, float o
     range.levelCount = 1;
     range.layerCount = 1;
     vkCmdClearColorImage(cmd, swapchainImages_[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+    
+    // If no image is loaded, we'll create a simple text overlay after clearing
 
     // Blit image if available
     if (textureImage_ && textureLayout_ == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
@@ -1173,6 +1212,11 @@ void VulkanRenderer::Render(uint32_t width, uint32_t height, float zoom, float o
             1, &blit, VK_FILTER_LINEAR);
     }
 
+    // If no image is loaded, render UI text instructions
+    if (!textureImage_ || textureLayout_ != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+        RenderInstructionalUI(cmd, swapchainImages_[imageIndex], width, height);
+    }
+    
     // Present transition
     VkImageMemoryBarrier post{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
     post.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -1909,6 +1953,284 @@ bool VulkanRenderer::InitializeWithProgress(HWND hwnd, ProgressCallback cb) {
     // NASA Standard: Mark Vulkan as available after successful initialization
     vulkanAvailable_ = true;
     return true;
+}
+
+bool VulkanRenderer::Initialize(SDL_Window* window) {
+    // NASA Standard: Validate input parameters
+    if (window == nullptr) {
+        return false;
+    }
+
+    // NASA Standard: Initialize all member variables to safe states
+    deviceLost_ = false;
+    swapchainOutOfDate_ = false;
+    vulkanAvailable_ = false;
+
+    // NASA Standard: Attempt Vulkan initialization with full error protection
+    if (!initInstance()) {
+        // NASA Standard: Vulkan unavailable - for SDL3 we don't have software fallback yet
+        return false;
+    }
+
+    if (!createSurface(window)) {
+        Shutdown(); // Clean up instance on failure
+        return false;
+    }
+
+    if (!pickPhysicalDevice()) {
+        Shutdown(); // Clean up instance and surface on failure
+        return false;
+    }
+
+    if (!createDeviceAndQueues()) {
+        Shutdown(); // Clean up all previous resources on failure
+        return false;
+    }
+
+    if (!createCommandPool()) {
+        Shutdown(); // Clean up all previous resources on failure
+        return false;
+    }
+
+    // Get initial window size for swapchain
+    int width, height;
+    SDL_GetWindowSize(window, &width, &height);
+    if (width <= 0) width = 800;
+    if (height <= 0) height = 600;
+
+    if (!createSwapchain(static_cast<uint32_t>(width), static_cast<uint32_t>(height))) {
+        Shutdown(); // Clean up all previous resources on failure
+        return false;
+    }
+
+    if (!createSyncObjects()) {
+        Shutdown(); // Clean up all previous resources on failure
+        return false;
+    }
+
+    // NASA Standard: Mark Vulkan as available after successful initialization
+    vulkanAvailable_ = true;
+    return true;
+}
+
+bool VulkanRenderer::InitializeWithProgress(SDL_Window* window, ProgressCallback cb) {
+    // NASA Standard: Validate input parameters
+    if (window == nullptr) {
+        return false;
+    }
+
+    // NASA Standard: Initialize all member variables to safe states
+    deviceLost_ = false;
+    swapchainOutOfDate_ = false;
+    vulkanAvailable_ = false;
+
+    if (cb) cb(5, L"Checking system and creating Vulkan instance...");
+
+    // NASA Standard: Attempt Vulkan initialization with full error protection
+    if (!initInstance()) {
+        if (cb) cb(100, L"Vulkan unavailable");
+        return false;
+    }
+
+    if (cb) cb(20, L"Creating presentation surface...");
+    if (!createSurface(window)) {
+        Shutdown();
+        return false;
+    }
+
+    if (cb) cb(35, L"Selecting physical device...");
+    if (!pickPhysicalDevice()) {
+        Shutdown();
+        return false;
+    }
+
+    if (cb) cb(55, L"Creating logical device and queues...");
+    if (!createDeviceAndQueues()) {
+        Shutdown();
+        return false;
+    }
+
+    if (cb) cb(65, L"Creating command pool...");
+    if (!createCommandPool()) {
+        Shutdown();
+        return false;
+    }
+
+    if (cb) cb(80, L"Creating swapchain...");
+    // Get initial window size for swapchain
+    int width, height;
+    SDL_GetWindowSize(window, &width, &height);
+    if (width <= 0) width = 800;
+    if (height <= 0) height = 600;
+    
+    if (!createSwapchain(static_cast<uint32_t>(width), static_cast<uint32_t>(height))) {
+        Shutdown();
+        return false;
+    }
+
+    if (cb) cb(90, L"Creating synchronization primitives...");
+    if (!createSyncObjects()){
+        Shutdown();
+        return false;
+    }
+
+    if (cb) cb(100, L"Vulkan ready");
+    
+    // NASA Standard: Mark Vulkan as available after successful initialization
+    vulkanAvailable_ = true;
+    return true;
+}
+
+// Instructional UI rendering using SDL3_ttf text renderer
+void VulkanRenderer::RenderInstructionalUI(VkCommandBuffer cmd, VkImage swapchainImage, uint32_t width, uint32_t height) {
+    // NASA Standard: Validate all input parameters
+    if (cmd == VK_NULL_HANDLE || swapchainImage == VK_NULL_HANDLE || width == 0 || height == 0) {
+        return;
+    }
+    
+    // Check if text renderer is available
+    if (!textRenderer_.IsReady()) {
+        // Fallback to simple color clear if text renderer isn't available
+        VkClearColorValue instructionalBackground = {{0.1f, 0.1f, 0.2f, 1.0f}}; // Dark blue background
+        VkImageSubresourceRange fullRange{};
+        fullRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        fullRange.baseMipLevel = 0;
+        fullRange.levelCount = 1;
+        fullRange.baseArrayLayer = 0;
+        fullRange.layerCount = 1;
+        
+        vkCmdClearColorImage(cmd, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           &instructionalBackground, 1, &fullRange);
+        return;
+    }
+    
+    // Create instructional UI surface with proper text
+    bool openColorIOAvailable = (colorProcessor_ != nullptr);
+    SDL_Surface* textSurface = textRenderer_.CreateInstructionalSurface(width, height, openColorIOAvailable);
+    if (!textSurface) {
+        Logger::Error("Failed to create instructional text surface");
+        return;
+    }
+    
+    // Convert surface to RGBA pixel data
+    std::vector<uint8_t> pixelData = textRenderer_.SurfaceToRGBA(textSurface);
+    SDL_DestroySurface(textSurface);
+    
+    if (pixelData.empty()) {
+        Logger::Error("Failed to convert text surface to pixel data");
+        return;
+    }
+    
+    // Create a temporary texture to upload the text data
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    VkDeviceSize dataSize = pixelData.size();
+    
+    if (!createStagingBuffer(dataSize, stagingBuffer, stagingMemory)) {
+        Logger::Error("Failed to create staging buffer for text overlay");
+        return;
+    }
+    
+    // Upload pixel data to staging buffer
+    void* mapped = nullptr;
+    bool deviceLost = false;
+    bool swapchainOutOfDate = false;
+    VkResult mapResult = vkMapMemory(device_, stagingMemory, 0, dataSize, 0, &mapped);
+    if (!checkVulkanOperation(mapResult, deviceLost, swapchainOutOfDate)) {
+        if (deviceLost) deviceLost_ = true;
+        vkDestroyBuffer(device_, stagingBuffer, nullptr);
+        vkFreeMemory(device_, stagingMemory, nullptr);
+        return;
+    }
+    
+    std::memcpy(mapped, pixelData.data(), dataSize);
+    vkUnmapMemory(device_, stagingMemory);
+    
+    // Create temporary image for text overlay
+    VkImage tempImage = VK_NULL_HANDLE;
+    VkDeviceMemory tempMemory = VK_NULL_HANDLE;
+    
+    VkImageCreateInfo ii{};
+    ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.extent = { width, height, 1 };
+    ii.mipLevels = 1;
+    ii.arrayLayers = 1;
+    ii.format = VK_FORMAT_R8G8B8A8_SRGB;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    
+    if (vkCreateImage(device_, &ii, nullptr, &tempImage) == VK_SUCCESS) {
+        VkMemoryRequirements req{};
+        vkGetImageMemoryRequirements(device_, tempImage, &req);
+        
+        VkMemoryAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        
+        if (ai.memoryTypeIndex != UINT32_MAX && vkAllocateMemory(device_, &ai, nullptr, &tempMemory) == VK_SUCCESS) {
+            vkBindImageMemory(device_, tempImage, tempMemory, 0);
+            
+            // Transition temp image to transfer dst
+            VkImageMemoryBarrier barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = tempImage;
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.layerCount = 1;
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, 0, nullptr, 0, nullptr, 1, &barrier);
+            
+            // Copy from staging buffer to temp image
+            VkBufferImageCopy copyRegion{};
+            copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copyRegion.imageSubresource.layerCount = 1;
+            copyRegion.imageExtent = { width, height, 1 };
+            vkCmdCopyBufferToImage(cmd, stagingBuffer, tempImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+            
+            // Transition temp image to transfer src
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, 0, nullptr, 0, nullptr, 1, &barrier);
+            
+            // Blit temp image to swapchain image
+            VkImageBlit blit{};
+            blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            blit.srcSubresource.layerCount = 1;
+            blit.srcOffsets[1] = { static_cast<int32_t>(width), static_cast<int32_t>(height), 1 };
+            blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            blit.dstSubresource.layerCount = 1;
+            blit.dstOffsets[1] = { static_cast<int32_t>(width), static_cast<int32_t>(height), 1 };
+            
+            vkCmdBlitImage(cmd, tempImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+        }
+    }
+    
+    // Clean up temporary resources
+    if (tempImage != VK_NULL_HANDLE) {
+        vkDestroyImage(device_, tempImage, nullptr);
+    }
+    if (tempMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(device_, tempMemory, nullptr);
+    }
+    vkDestroyBuffer(device_, stagingBuffer, nullptr);
+    vkFreeMemory(device_, stagingMemory, nullptr);
 }
 
 #endif // _WIN32

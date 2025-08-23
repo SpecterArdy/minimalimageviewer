@@ -10,6 +10,13 @@
 #include "vulkan_renderer.h"
 #include "logging.h"
 
+#ifdef _WIN32
+#include <commdlg.h>
+#include <shlwapi.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#endif
+
 namespace OCIO = OCIO_NAMESPACE;
 
 extern AppContext g_ctx;
@@ -27,6 +34,14 @@ static std::string wstring_to_utf8(const std::wstring& wstr) {
     WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
     return strTo;
 }
+
+#ifdef _WIN32
+static HWND GetHWNDFromSDL() {
+    if (!g_ctx.window) return nullptr;
+    SDL_PropertiesID props = SDL_GetWindowProperties(g_ctx.window);
+    return (HWND)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+}
+#endif
 
 static bool IsImageFile(const wchar_t* filePath) {
     // Clear any previous errors first
@@ -74,7 +89,8 @@ void LoadImageFromFile(const wchar_t* filePath) {
 #endif
         if (!error.empty()) {
             std::wstring werror(error.begin(), error.end());
-            MessageBoxW(g_ctx.hWnd, (L"Failed to open image: " + werror).c_str(), L"Image Load Error", MB_OK | MB_ICONWARNING);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "Image Load Error", 
+                                ("Failed to open image: " + error).c_str(), g_ctx.window);
         }
         CenterImage(true);
         return;
@@ -586,7 +602,27 @@ void DeleteCurrentImage() {
 
     std::wstring msg = L"Are you sure you want to move this file to the Recycle Bin?\n\n" + filePathToDelete;
 
-    if (MessageBoxW(g_ctx.hWnd, msg.c_str(), L"Confirm Delete", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+#ifdef _WIN32
+    HWND hwnd = GetHWNDFromSDL();
+    if (MessageBoxW(hwnd, msg.c_str(), L"Confirm Delete", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+#else
+    // For non-Windows platforms, use SDL message box
+    const SDL_MessageBoxButtonData buttons[] = {
+        { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "No" },
+        { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Yes" }
+    };
+    const SDL_MessageBoxData messageboxdata = {
+        SDL_MESSAGEBOX_QUESTION,
+        g_ctx.window,
+        "Confirm Delete",
+        ("Are you sure you want to delete this file?\n\n" + wstring_to_utf8(filePathToDelete)).c_str(),
+        SDL_arraysize(buttons),
+        buttons,
+        nullptr
+    };
+    int buttonid;
+    if (SDL_ShowMessageBox(&messageboxdata, &buttonid) >= 0 && buttonid == 1) {
+#endif
         // NASA Standard: Check for potential overflow in buffer size calculation
         size_t requiredSize = filePathToDelete.length() + 2;
         if (requiredSize > MAX_PATH + 2) {
@@ -594,7 +630,12 @@ void DeleteCurrentImage() {
             deleteSpan.set_tag("success", "false");
             deleteSpan.set_tag("error", "Path too long for deletion");
 #endif
-            MessageBoxW(g_ctx.hWnd, L"File path is too long for deletion.", L"Error", MB_OK | MB_ICONERROR);
+#ifdef _WIN32
+            HWND hwnd = GetHWNDFromSDL();
+            MessageBoxW(hwnd, L"File path is too long for deletion.", L"Error", MB_OK | MB_ICONERROR);
+#else
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", "File path is too long for deletion.", g_ctx.window);
+#endif
             return;
         }
 
@@ -604,12 +645,21 @@ void DeleteCurrentImage() {
             deleteSpan.set_tag("success", "false");
             deleteSpan.set_tag("error", "Failed to prepare path for deletion");
 #endif
-            MessageBoxW(g_ctx.hWnd, L"Failed to prepare file path for deletion.", L"Error", MB_OK | MB_ICONERROR);
+#ifdef _WIN32
+            HWND hwnd = GetHWNDFromSDL();
+            MessageBoxW(hwnd, L"Failed to prepare file path for deletion.", L"Error", MB_OK | MB_ICONERROR);
+#else
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", "Failed to prepare file path for deletion.", g_ctx.window);
+#endif
             return;
         }
 
         SHFILEOPSTRUCTW sfos = { 0 };
-        sfos.hwnd = g_ctx.hWnd;
+#ifdef _WIN32
+        sfos.hwnd = GetHWNDFromSDL();
+#else
+        sfos.hwnd = nullptr;
+#endif
         sfos.wFunc = FO_DELETE;
         sfos.pFrom = pFromBuffer.data();
         sfos.fFlags = FOF_ALLOWUNDO | FOF_SILENT | FOF_NOCONFIRMATION;
@@ -622,7 +672,9 @@ void DeleteCurrentImage() {
             if (g_ctx.imageFiles.empty()) {
                 g_ctx.imageData.clear();
                 g_ctx.currentImageIndex = -1;
-                InvalidateRect(g_ctx.hWnd, nullptr, FALSE);
+                if (g_ctx.window) {
+                    // SDL3 will trigger a redraw automatically
+                }
             }
             else {
                 if (g_ctx.currentImageIndex >= static_cast<int>(g_ctx.imageFiles.size())) {
@@ -636,7 +688,16 @@ void DeleteCurrentImage() {
             deleteSpan.set_tag("success", "false");
             deleteSpan.set_tag("error", "SHFileOperation failed");
 #endif
-            MessageBoxW(g_ctx.hWnd, L"Failed to delete the file.", L"Error", MB_OK | MB_ICONERROR);
+#ifdef _WIN32
+#ifdef _WIN32
+            HWND hwnd = GetHWNDFromSDL();
+            MessageBoxW(hwnd, L"Failed to delete the file.", L"Error", MB_OK | MB_ICONERROR);
+#else
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", "Failed to delete the file.", g_ctx.window);
+#endif
+#else
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", "Failed to delete the file.", g_ctx.window);
+#endif
         }
     } else {
 #ifdef HAVE_DATADOG
@@ -707,7 +768,11 @@ void SaveImageAs() {
 
     wchar_t szFile[MAX_PATH] = L"Untitled.png";
     OPENFILENAMEW ofn = { sizeof(ofn) };
-    ofn.hwndOwner = g_ctx.hWnd;
+#ifdef _WIN32
+    ofn.hwndOwner = GetHWNDFromSDL();
+#else
+    ofn.hwndOwner = nullptr;
+#endif
     ofn.lpstrFile = szFile;
     ofn.nMaxFile = MAX_PATH;
     ofn.lpstrFilter = L"PNG File (*.png)\0*.png\0JPEG File (*.jpg)\0*.jpg\0OpenEXR File (*.exr)\0*.exr\0TIFF File (*.tiff)\0*.tiff\0All Files (*.*)\0*.*\0";
@@ -730,13 +795,23 @@ void SaveImageAs() {
     std::vector<uint8_t> imageData = GetRenderedImageData(width, height);
 
     if (imageData.empty()) {
-        MessageBoxW(g_ctx.hWnd, L"Could not get image data to save.", L"Save Error", MB_ICONERROR);
+#ifdef _WIN32
+        HWND hwnd = GetHWNDFromSDL();
+        MessageBoxW(hwnd, L"Could not get image data to save.", L"Save Error", MB_ICONERROR);
+#else
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Save Error", "Could not get image data to save.", g_ctx.window);
+#endif
         return;
     }
 
     auto out = OIIO::ImageOutput::create(utf8Path);
     if (!out) {
-        MessageBoxW(g_ctx.hWnd, L"Could not create output file.", L"Save Error", MB_ICONERROR);
+#ifdef _WIN32
+        HWND hwnd = GetHWNDFromSDL();
+        MessageBoxW(hwnd, L"Could not create output file.", L"Save Error", MB_ICONERROR);
+#else
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Save Error", "Could not create output file.", g_ctx.window);
+#endif
         return;
     }
 
@@ -750,7 +825,12 @@ void SaveImageAs() {
     }
 
     if (!out->open(utf8Path, spec)) {
-        MessageBoxW(g_ctx.hWnd, L"Could not open output file.", L"Save Error", MB_ICONERROR);
+#ifdef _WIN32
+        HWND hwnd = GetHWNDFromSDL();
+        MessageBoxW(hwnd, L"Could not open output file.", L"Save Error", MB_ICONERROR);
+#else
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Save Error", "Could not open output file.", g_ctx.window);
+#endif
         return;
     }
 
@@ -772,7 +852,12 @@ void SaveImageAs() {
         LoadImageFromFile(ofn.lpstrFile);
         GetImagesInDirectory(ofn.lpstrFile);
     } else {
-        MessageBoxW(g_ctx.hWnd, L"Failed to save image.", L"Save As Error", MB_ICONERROR);
+#ifdef _WIN32
+        HWND hwnd = GetHWNDFromSDL();
+        MessageBoxW(hwnd, L"Failed to save image.", L"Save As Error", MB_ICONERROR);
+#else
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Save As Error", "Failed to save image.", g_ctx.window);
+#endif
     }
 }
 
@@ -783,7 +868,12 @@ void SaveImage() {
     }
 
     if (g_ctx.rotationAngle == 0) {
-        MessageBoxW(g_ctx.hWnd, L"No changes to save.", L"Save", MB_OK | MB_ICONINFORMATION);
+#ifdef _WIN32
+        HWND hwnd = GetHWNDFromSDL();
+        MessageBoxW(hwnd, L"No changes to save.", L"Save", MB_OK | MB_ICONINFORMATION);
+#else
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFO, "Save", "No changes to save.", g_ctx.window);
+#endif
         return;
     }
 
@@ -793,7 +883,12 @@ void SaveImage() {
     // Get the original file format
     auto in = OIIO::ImageInput::open(utf8Path);
     if (!in) {
-        MessageBoxW(g_ctx.hWnd, L"Could not open original file to determine format.", L"Save Error", MB_ICONERROR);
+#ifdef _WIN32
+        HWND hwnd = GetHWNDFromSDL();
+        MessageBoxW(hwnd, L"Could not open original file to determine format.", L"Save Error", MB_ICONERROR);
+#else
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Save Error", "Could not open original file to determine format.", g_ctx.window);
+#endif
         return;
     }
 
@@ -804,13 +899,23 @@ void SaveImage() {
     std::vector<uint8_t> imageData = GetRenderedImageData(width, height);
 
     if (imageData.empty()) {
-        MessageBoxW(g_ctx.hWnd, L"Could not get image data to save.", L"Save Error", MB_ICONERROR);
+#ifdef _WIN32
+        HWND hwnd = GetHWNDFromSDL();
+        MessageBoxW(hwnd, L"Could not get image data to save.", L"Save Error", MB_ICONERROR);
+#else
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Save Error", "Could not get image data to save.", g_ctx.window);
+#endif
         return;
     }
 
     // NASA Standard: Validate path length before concatenation
     if (originalPath.length() > MAX_PATH - 20) {
-        MessageBoxW(g_ctx.hWnd, L"File path too long for temporary file creation.", L"Save Error", MB_ICONERROR);
+#ifdef _WIN32
+        HWND hwnd = GetHWNDFromSDL();
+        MessageBoxW(hwnd, L"File path too long for temporary file creation.", L"Save Error", MB_ICONERROR);
+#else
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Save Error", "File path too long for temporary file creation.", g_ctx.window);
+#endif
         return;
     }
 
@@ -819,7 +924,12 @@ void SaveImage() {
 
     auto out = OIIO::ImageOutput::create(utf8TempPath);
     if (!out) {
-        MessageBoxW(g_ctx.hWnd, L"Could not create output file.", L"Save Error", MB_ICONERROR);
+#ifdef _WIN32
+        HWND hwnd = GetHWNDFromSDL();
+        MessageBoxW(hwnd, L"Could not create output file.", L"Save Error", MB_ICONERROR);
+#else
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Save Error", "Could not create output file.", g_ctx.window);
+#endif
         return;
     }
 
@@ -834,7 +944,12 @@ void SaveImage() {
     }
 
     if (!out->open(utf8TempPath, spec)) {
-        MessageBoxW(g_ctx.hWnd, L"Could not open temporary file for writing.", L"Save Error", MB_ICONERROR);
+#ifdef _WIN32
+        HWND hwnd = GetHWNDFromSDL();
+        MessageBoxW(hwnd, L"Could not open temporary file for writing.", L"Save Error", MB_ICONERROR);
+#else
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Save Error", "Could not open temporary file for writing.", g_ctx.window);
+#endif
         return;
     }
 
@@ -854,32 +969,71 @@ void SaveImage() {
         if (ReplaceFileW(originalPath.c_str(), tempPath.c_str(), nullptr, REPLACEFILE_IGNORE_MERGE_ERRORS, nullptr, nullptr)) {
             LoadImageFromFile(originalPath.c_str());
             g_ctx.rotationAngle = 0;
-            InvalidateRect(g_ctx.hWnd, NULL, FALSE);
+            // SDL3 will trigger a redraw automatically
         } else {
             DeleteFileW(tempPath.c_str());
-            MessageBoxW(g_ctx.hWnd, L"Failed to replace the original file.", L"Save Error", MB_ICONERROR);
+#ifdef _WIN32
+            HWND hwnd = GetHWNDFromSDL();
+            MessageBoxW(hwnd, L"Failed to replace the original file.", L"Save Error", MB_ICONERROR);
+#else
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Save Error", "Failed to replace the original file.", g_ctx.window);
+#endif
         }
     } else {
         DeleteFileW(tempPath.c_str());
-        MessageBoxW(g_ctx.hWnd, L"Failed to save image to temporary file.", L"Save Error", MB_ICONERROR);
+#ifdef _WIN32
+        HWND hwnd = GetHWNDFromSDL();
+        MessageBoxW(hwnd, L"Failed to save image to temporary file.", L"Save Error", MB_ICONERROR);
+#else
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Save Error", "Failed to save image to temporary file.", g_ctx.window);
+#endif
     }
 }
 
-void HandleDropFiles(HDROP hDrop) {
+// UTF-8 wrapper functions for compatibility
+void LoadImageFromFile(const char* filePath) {
+    if (!filePath) return;
+    
+    // Convert UTF-8 to UTF-16
+    int sizeNeeded = MultiByteToWideChar(CP_UTF8, 0, filePath, -1, nullptr, 0);
+    if (sizeNeeded <= 0) return;
+    
+    std::vector<wchar_t> wfilePath(sizeNeeded);
+    MultiByteToWideChar(CP_UTF8, 0, filePath, -1, wfilePath.data(), sizeNeeded);
+    
+    LoadImageFromFile(wfilePath.data());
+}
+
+void GetImagesInDirectory(const char* filePath) {
+    if (!filePath) return;
+    
+    // Convert UTF-8 to UTF-16
+    int sizeNeeded = MultiByteToWideChar(CP_UTF8, 0, filePath, -1, nullptr, 0);
+    if (sizeNeeded <= 0) return;
+    
+    std::vector<wchar_t> wfilePath(sizeNeeded);
+    MultiByteToWideChar(CP_UTF8, 0, filePath, -1, wfilePath.data(), sizeNeeded);
+    
+    GetImagesInDirectory(wfilePath.data());
+}
+
+void HandleDropFiles(const std::vector<std::string>& filePaths) {
     // NASA Standard: Validate input parameters
-    if (hDrop == nullptr) {
+    if (filePaths.empty()) {
+        Logger::Error("HandleDropFiles: filePaths is empty");
         return;
     }
 
-    wchar_t filePath[MAX_PATH] = { 0 };
-    UINT result = DragQueryFileW(hDrop, 0, filePath, MAX_PATH);
-    if (result > 0 && result < MAX_PATH) {
-        // NASA Standard: Ensure null termination
-        filePath[MAX_PATH - 1] = L'\0';
-        LoadImageFromFile(filePath);
-        GetImagesInDirectory(filePath);
-    }
-    DragFinish(hDrop);
+    Logger::Info("HandleDropFiles: Processing %zu dropped files", filePaths.size());
+    
+    // Process the first file (consistent with original behavior)
+    const std::string& filePath = filePaths[0];
+    Logger::Info("HandleDropFiles: Loading file: %s", filePath.c_str());
+    
+    LoadImageFromFile(filePath.c_str());
+    GetImagesInDirectory(filePath.c_str());
+    
+    Logger::Info("HandleDropFiles: Processing complete");
 }
 
 void HandlePaste() {
@@ -888,9 +1042,15 @@ void HandlePaste() {
         return;
     }
 
-    if (!OpenClipboard(g_ctx.hWnd)) {
+#ifdef _WIN32
+    HWND hwnd = GetHWNDFromSDL();
+    if (!OpenClipboard(hwnd)) {
         return;
     }
+#else
+    // On non-Windows platforms, clipboard operations are different
+    return;
+#endif
 
     HANDLE hClipData = GetClipboardData(CF_HDROP);
     if (hClipData != nullptr) {
@@ -911,10 +1071,19 @@ void HandlePaste() {
 }
 
 void HandleCopy() {
+#ifdef _WIN32
+    HWND hwnd = GetHWNDFromSDL();
     // NASA Standard: Validate preconditions
-    if (!g_ctx.imageData.isValid() || !OpenClipboard(g_ctx.hWnd)) {
+    if (!g_ctx.imageData.isValid() || !OpenClipboard(hwnd)) {
         return;
     }
+#else
+    // On non-Windows platforms, clipboard operations are different
+    if (!g_ctx.imageData.isValid()) {
+        return;
+    }
+    return; // TODO: Implement cross-platform clipboard support
+#endif
     EmptyClipboard();
 
     uint32_t width, height;
@@ -975,7 +1144,12 @@ void OpenFileLocationAction() {
 
     // NASA Standard: Validate path before use
     if (filePath.empty() || filePath.length() >= MAX_PATH) {
-        MessageBoxW(g_ctx.hWnd, L"Invalid file path.", L"Error", MB_OK | MB_ICONERROR);
+#ifdef _WIN32
+        HWND hwnd = GetHWNDFromSDL();
+        MessageBoxW(hwnd, L"Invalid file path.", L"Error", MB_OK | MB_ICONERROR);
+#else
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", "Invalid file path.", g_ctx.window);
+#endif
         return;
     }
 
@@ -986,9 +1160,19 @@ void OpenFileLocationAction() {
         ILFree(pidl);
 
         if (FAILED(openResult)) {
-            MessageBoxW(g_ctx.hWnd, L"Could not open file location.", L"Error", MB_OK | MB_ICONERROR);
+#ifdef _WIN32
+            HWND hwnd = GetHWNDFromSDL();
+            MessageBoxW(hwnd, L"Could not open file location.", L"Error", MB_OK | MB_ICONERROR);
+#else
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", "Could not open file location.", g_ctx.window);
+#endif
         }
     } else {
-        MessageBoxW(g_ctx.hWnd, L"Could not parse file path.", L"Error", MB_OK | MB_ICONERROR);
+#ifdef _WIN32
+        HWND hwnd = GetHWNDFromSDL();
+        MessageBoxW(hwnd, L"Could not parse file path.", L"Error", MB_OK | MB_ICONERROR);
+#else
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", "Could not parse file path.", g_ctx.window);
+#endif
     }
 }

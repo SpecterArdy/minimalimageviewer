@@ -1,14 +1,23 @@
 #include "viewer.h"
 #include "vulkan_renderer.h"
 
-// Default constructor/destructor can be defaulted now that VulkanRenderer is complete here.
-AppContext::AppContext() = default;
-AppContext::~AppContext() = default;
+// Default constructor/destructor with SDL3 initialization
+AppContext::AppContext() {
+    // Don't create mutex in constructor - SDL may not be initialized yet
+    // Will be created later in main() after SDL_Init()
+    renderLock = nullptr;
+    renderInProgress.store(false, std::memory_order_relaxed);
+}
+
+AppContext::~AppContext() {
+    if (renderLock) {
+        SDL_DestroyMutex(renderLock);
+    }
+}
 
 // Copy: copy everything except the renderer (leave null in the copy)
 AppContext::AppContext(const AppContext& other)
-    : hInst(other.hInst),
-      hWnd(other.hWnd),
+    : window(other.window),
       imageData(other.imageData),
       imageFiles(other.imageFiles),
       currentImageIndex(other.currentImageIndex),
@@ -17,12 +26,13 @@ AppContext::AppContext(const AppContext& other)
       offsetX(other.offsetX),
       offsetY(other.offsetY),
       isFullScreen(other.isFullScreen),
-      savedStyle(other.savedStyle),
-      savedRect(other.savedRect),
+      savedWindowRect(other.savedWindowRect),
+      savedMaximized(other.savedMaximized),
       renderer(nullptr),
       ocioConfig(other.ocioConfig),
       currentDisplayTransform(other.currentDisplayTransform),
       displayDevice(other.displayDevice),
+      ocioEnabled(other.ocioEnabled),
       showFilePath(other.showFilePath),
       currentFilePathOverride(other.currentFilePathOverride),
       isHoveringClose(other.isHoveringClose),
@@ -32,15 +42,14 @@ AppContext::AppContext(const AppContext& other)
       fps(other.fps),
       rendererNeedsReset(other.rendererNeedsReset) 
 {
-    // Reinitialize synchronization primitives for this new instance
-    InitializeSRWLock(&renderLock);
+    // Create new mutex for this instance
+    renderLock = SDL_CreateMutex();
     renderInProgress.store(false, std::memory_order_relaxed);
 }
 
 AppContext& AppContext::operator=(const AppContext& other) {
     if (this != &other) {
-        hInst = other.hInst;
-        hWnd = other.hWnd;
+        window = other.window;
         imageData = other.imageData;
         imageFiles = other.imageFiles;
         currentImageIndex = other.currentImageIndex;
@@ -49,13 +58,14 @@ AppContext& AppContext::operator=(const AppContext& other) {
         offsetX = other.offsetX;
         offsetY = other.offsetY;
         isFullScreen = other.isFullScreen;
-        savedStyle = other.savedStyle;
-        savedRect = other.savedRect;
+        savedWindowRect = other.savedWindowRect;
+        savedMaximized = other.savedMaximized;
         // renderer is not copied; ensure null
         renderer.reset();
         ocioConfig = other.ocioConfig;
         currentDisplayTransform = other.currentDisplayTransform;
         displayDevice = other.displayDevice;
+        ocioEnabled = other.ocioEnabled;
         showFilePath = other.showFilePath;
         currentFilePathOverride = other.currentFilePathOverride;
         isHoveringClose = other.isHoveringClose;
@@ -68,10 +78,9 @@ AppContext& AppContext::operator=(const AppContext& other) {
     return *this;
 }
 
-// Custom moves: std::atomic and SRWLOCK are not movable; reinitialize them safely.
+// Custom moves: std::atomic and SDL_Mutex are not movable; reinitialize them safely.
 AppContext::AppContext(AppContext&& other) noexcept
-    : hInst(other.hInst),
-      hWnd(other.hWnd),
+    : window(other.window),
       imageData(std::move(other.imageData)),
       imageFiles(std::move(other.imageFiles)),
       currentImageIndex(other.currentImageIndex),
@@ -80,12 +89,13 @@ AppContext::AppContext(AppContext&& other) noexcept
       offsetX(other.offsetX),
       offsetY(other.offsetY),
       isFullScreen(other.isFullScreen),
-      savedStyle(other.savedStyle),
-      savedRect(other.savedRect),
+      savedWindowRect(other.savedWindowRect),
+      savedMaximized(other.savedMaximized),
       renderer(std::move(other.renderer)),
       ocioConfig(other.ocioConfig),
       currentDisplayTransform(other.currentDisplayTransform),
       displayDevice(std::move(other.displayDevice)),
+      ocioEnabled(other.ocioEnabled),
       showFilePath(other.showFilePath),
       currentFilePathOverride(std::move(other.currentFilePathOverride)),
       isHoveringClose(other.isHoveringClose),
@@ -95,18 +105,22 @@ AppContext::AppContext(AppContext&& other) noexcept
       fps(other.fps),
       rendererNeedsReset(other.rendererNeedsReset)
 {
-    InitializeSRWLock(&renderLock);
+    renderLock = SDL_CreateMutex();
     renderInProgress.store(false, std::memory_order_relaxed);
 
     // Leave source in benign state
-    other.hWnd = nullptr;
+    other.window = nullptr;
     other.rendererNeedsReset = false;
 }
 
 AppContext& AppContext::operator=(AppContext&& other) noexcept {
     if (this != &other) {
-        hInst = other.hInst;
-        hWnd = other.hWnd;
+        // Clean up existing mutex
+        if (renderLock) {
+            SDL_DestroyMutex(renderLock);
+        }
+        
+        window = other.window;
         imageData = std::move(other.imageData);
         imageFiles = std::move(other.imageFiles);
         currentImageIndex = other.currentImageIndex;
@@ -115,12 +129,13 @@ AppContext& AppContext::operator=(AppContext&& other) noexcept {
         offsetX = other.offsetX;
         offsetY = other.offsetY;
         isFullScreen = other.isFullScreen;
-        savedStyle = other.savedStyle;
-        savedRect = other.savedRect;
+        savedWindowRect = other.savedWindowRect;
+        savedMaximized = other.savedMaximized;
         renderer = std::move(other.renderer);
         ocioConfig = other.ocioConfig;
         currentDisplayTransform = other.currentDisplayTransform;
         displayDevice = std::move(other.displayDevice);
+        ocioEnabled = other.ocioEnabled;
         showFilePath = other.showFilePath;
         currentFilePathOverride = std::move(other.currentFilePathOverride);
         isHoveringClose = other.isHoveringClose;
@@ -131,10 +146,10 @@ AppContext& AppContext::operator=(AppContext&& other) noexcept {
         rendererNeedsReset = other.rendererNeedsReset;
 
         // Reinitialize our sync primitives/flags
-        InitializeSRWLock(&renderLock);
+        renderLock = SDL_CreateMutex();
         renderInProgress.store(false, std::memory_order_relaxed);
 
-        other.hWnd = nullptr;
+        other.window = nullptr;
         other.rendererNeedsReset = false;
     }
     return *this;

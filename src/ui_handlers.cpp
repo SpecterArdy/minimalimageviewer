@@ -1,17 +1,22 @@
 #include "viewer.h"
+#include <SDL3/SDL.h>
 #include <cmath>
 #include "logging.h"
+
+#ifdef _WIN32
+#include <commdlg.h>
+#endif
 
 extern AppContext g_ctx;
 
 //
-// UI Action Helpers
+// SDL3 UI Action Helpers
 //
 
-static RECT GetCloseButtonRect() {
-    RECT clientRect{};
-    GetClientRect(g_ctx.hWnd, &clientRect);
-    return { clientRect.right - 30, 0, clientRect.right, 20 };
+static SDL_Rect GetCloseButtonRect() {
+    int w, h;
+    SDL_GetWindowSize(g_ctx.window, &w, &h);
+    return { w - 30, 0, 30, 20 };
 }
 
 static void OpenFileAction() {
@@ -19,13 +24,21 @@ static void OpenFileAction() {
     auto openSpan = Logger::CreateSpan("ui.open_file");
 #endif
     
+#ifdef _WIN32
+    // On Windows, use the native file dialog
     wchar_t szFile[MAX_PATH] = { 0 };
     OPENFILENAMEW ofn = { sizeof(OPENFILENAMEW) };
-    ofn.hwndOwner = g_ctx.hWnd;
+    
+    // Get the native window handle from SDL
+    SDL_PropertiesID props = SDL_GetWindowProperties(g_ctx.window);
+    HWND hwnd = (HWND)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+    
+    ofn.hwndOwner = hwnd;
     ofn.lpstrFilter = L"All Image Files\0*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tiff;*.tif;*.ico;*.webp;*.heic;*.heif;*.avif;*.cr2;*.cr3;*.nef;*.dng;*.arw;*.orf;*.rw2\0All Files\0*.*\0";
     ofn.lpstrFile = szFile;
     ofn.nMaxFile = MAX_PATH;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_EXPLORER;
+    
     if (GetOpenFileNameW(&ofn)) {
 #ifdef HAVE_DATADOG
         openSpan.set_tag("file_selected", "true");
@@ -45,6 +58,13 @@ static void OpenFileAction() {
         openSpan.set_tag("file_selected", "false");
 #endif
     }
+#else
+    // For other platforms, could use SDL3 file dialogs when they become available
+    // For now, show a simple message
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Open File", 
+                            "File dialog not implemented on this platform yet. Use drag and drop instead.", 
+                            g_ctx.window);
+#endif
 }
 
 static void ToggleFullScreen() {
@@ -54,137 +74,51 @@ static void ToggleFullScreen() {
 #endif
     
     if (!g_ctx.isFullScreen) {
-        g_ctx.savedStyle = GetWindowLong(g_ctx.hWnd, GWL_STYLE);
-        GetWindowRect(g_ctx.hWnd, &g_ctx.savedRect);
-        HMONITOR hMonitor = MonitorFromWindow(g_ctx.hWnd, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO mi = { sizeof(mi) };
-        GetMonitorInfo(hMonitor, &mi);
-        SetWindowLong(g_ctx.hWnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
-        SetWindowPos(g_ctx.hWnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
-            mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
-            SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        // Save current window state
+        SDL_GetWindowPosition(g_ctx.window, &g_ctx.savedWindowRect.x, &g_ctx.savedWindowRect.y);
+        SDL_GetWindowSize(g_ctx.window, &g_ctx.savedWindowRect.w, &g_ctx.savedWindowRect.h);
+        g_ctx.savedMaximized = (SDL_GetWindowFlags(g_ctx.window) & SDL_WINDOW_MAXIMIZED) != 0;
+        
+        // Enter fullscreen
+        SDL_SetWindowFullscreen(g_ctx.window, true);
         g_ctx.isFullScreen = true;
-    }
-    else {
-        SetWindowLong(g_ctx.hWnd, GWL_STYLE, g_ctx.savedStyle | WS_VISIBLE);
-        SetWindowPos(g_ctx.hWnd, HWND_NOTOPMOST, g_ctx.savedRect.left, g_ctx.savedRect.top,
-            g_ctx.savedRect.right - g_ctx.savedRect.left, g_ctx.savedRect.bottom - g_ctx.savedRect.top,
-            SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    } else {
+        // Exit fullscreen
+        SDL_SetWindowFullscreen(g_ctx.window, false);
+        
+        // Restore previous window state
+        SDL_SetWindowPosition(g_ctx.window, g_ctx.savedWindowRect.x, g_ctx.savedWindowRect.y);
+        SDL_SetWindowSize(g_ctx.window, g_ctx.savedWindowRect.w, g_ctx.savedWindowRect.h);
+        
+        if (g_ctx.savedMaximized) {
+            SDL_MaximizeWindow(g_ctx.window);
+        }
+        
         g_ctx.isFullScreen = false;
     }
     FitImageToWindow();
 }
 
 //
-// Message Handlers
+// SDL3 Event Handlers
 //
 
-static void OnPaint(HWND hWnd) {
-#ifdef HAVE_DATADOG
-    auto paintSpan = Logger::CreateSpan("ui.paint");
-    paintSpan.set_tag("minimized", IsIconic(hWnd) ? "true" : "false");
-    paintSpan.set_tag("has_image", g_ctx.imageData.isValid() ? "true" : "false");
-#endif
-    
-    PAINTSTRUCT ps{};
-    HDC hdc = BeginPaint(hWnd, &ps);
-    RECT clientRect{};
-    GetClientRect(hWnd, &clientRect);
-    
-#ifdef HAVE_DATADOG
-    paintSpan.set_tag("width", std::to_string(clientRect.right));
-    paintSpan.set_tag("height", std::to_string(clientRect.bottom));
-#endif
-
-    HDC memDC = CreateCompatibleDC(hdc);
-    HBITMAP memBitmap = CreateCompatibleBitmap(hdc, clientRect.right, clientRect.bottom);
-    HBITMAP oldBitmap = static_cast<HBITMAP>(SelectObject(memDC, memBitmap));
-
-    FillRect(memDC, &clientRect, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-
-    if (g_ctx.imageData.isValid() && !IsIconic(hWnd)) {
-        DrawImage(memDC, clientRect, g_ctx);
-    }
-    else if (!g_ctx.imageData.isValid()) {
-        SetTextColor(memDC, RGB(255, 255, 255));
-        SetBkMode(memDC, TRANSPARENT);
-        DrawTextW(memDC, L"Right-click for options or drag an image here", -1, &clientRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    }
-
-    if (g_ctx.showFilePath) {
-        std::wstring pathToDisplay;
-        if (!g_ctx.currentFilePathOverride.empty()) {
-            pathToDisplay = g_ctx.currentFilePathOverride;
-        }
-        else if (g_ctx.currentImageIndex >= 0 && g_ctx.currentImageIndex < static_cast<int>(g_ctx.imageFiles.size())) {
-            pathToDisplay = g_ctx.imageFiles[g_ctx.currentImageIndex];
-        }
-
-        if (!pathToDisplay.empty()) {
-            SetBkMode(memDC, TRANSPARENT);
-            HFONT hPathFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-            HFONT hOldPathFont = static_cast<HFONT>(SelectObject(memDC, hPathFont));
-
-            RECT textRect = clientRect;
-            textRect.bottom -= 5;
-            textRect.right -= 5;
-
-            RECT shadowRect = textRect;
-            OffsetRect(&shadowRect, 1, 1);
-            SetTextColor(memDC, RGB(0, 0, 0));
-            DrawTextW(memDC, pathToDisplay.c_str(), -1, &shadowRect, DT_RIGHT | DT_BOTTOM | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-
-            SetTextColor(memDC, RGB(220, 220, 220));
-            DrawTextW(memDC, pathToDisplay.c_str(), -1, &textRect, DT_RIGHT | DT_BOTTOM | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-
-            SelectObject(memDC, hOldPathFont);
-            DeleteObject(hPathFont);
-        }
-    }
-
-    RECT closeRect = GetCloseButtonRect();
-    HPEN hPen;
-    if (g_ctx.isHoveringClose) {
-        hPen = CreatePen(PS_SOLID, 2, RGB(220, 50, 50));
-    }
-    else {
-        hPen = CreatePen(PS_SOLID, 1, RGB(70, 70, 70));
-    }
-    HPEN hOldPen = static_cast<HPEN>(SelectObject(memDC, hPen));
-
-    MoveToEx(memDC, closeRect.left + 9, closeRect.top + 6, nullptr);
-    LineTo(memDC, closeRect.right - 9, closeRect.bottom - 6);
-    MoveToEx(memDC, closeRect.right - 9, closeRect.top + 6, nullptr);
-    LineTo(memDC, closeRect.left + 9, closeRect.bottom - 6);
-
-    SelectObject(memDC, hOldPen);
-    DeleteObject(hPen);
-
-    BitBlt(hdc, ps.rcPaint.left, ps.rcPaint.top,
-        ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
-        memDC, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
-
-    SelectObject(memDC, oldBitmap);
-    DeleteObject(memBitmap);
-    DeleteDC(memDC);
-    EndPaint(hWnd, &ps);
-}
-
-static void OnKeyDown(WPARAM wParam) {
+void HandleKeyboardEvent(const SDL_KeyboardEvent& event) {
 #ifdef HAVE_DATADOG
     auto keySpan = Logger::CreateSpan("ui.keydown");
-    keySpan.set_tag("key_code", std::to_string(static_cast<int>(wParam)));
+    keySpan.set_tag("key_code", std::to_string(static_cast<int>(event.key)));
 #endif
     
-    bool ctrlPressed = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    bool ctrlPressed = (SDL_GetModState() & SDL_KMOD_CTRL) != 0;
+    bool shiftPressed = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
+    
 #ifdef HAVE_DATADOG
     keySpan.set_tag("ctrl_pressed", ctrlPressed ? "true" : "false");
+    keySpan.set_tag("shift_pressed", shiftPressed ? "true" : "false");
 #endif
 
-    switch (wParam) {
-    case VK_RIGHT:
+    switch (event.key) {
+    case SDLK_RIGHT:
 #ifdef HAVE_DATADOG
         keySpan.set_tag("action", "next_image");
 #endif
@@ -193,7 +127,8 @@ static void OnKeyDown(WPARAM wParam) {
             LoadImageFromFile(g_ctx.imageFiles[g_ctx.currentImageIndex].c_str());
         }
         break;
-    case VK_LEFT:
+        
+    case SDLK_LEFT:
 #ifdef HAVE_DATADOG
         keySpan.set_tag("action", "previous_image");
 #endif
@@ -202,37 +137,46 @@ static void OnKeyDown(WPARAM wParam) {
             LoadImageFromFile(g_ctx.imageFiles[g_ctx.currentImageIndex].c_str());
         }
         break;
-    case VK_UP:    
+        
+    case SDLK_UP:
 #ifdef HAVE_DATADOG
         keySpan.set_tag("action", "rotate_clockwise");
 #endif
-        RotateImage(true); 
+        RotateImage(true);
         break;
-    case VK_DOWN:  
+        
+    case SDLK_DOWN:
 #ifdef HAVE_DATADOG
         keySpan.set_tag("action", "rotate_counterclockwise");
 #endif
-        RotateImage(false); 
+        RotateImage(false);
         break;
-    case VK_DELETE: 
+        
+    case SDLK_DELETE:
 #ifdef HAVE_DATADOG
         keySpan.set_tag("action", "delete_image");
 #endif
-        DeleteCurrentImage(); 
+        DeleteCurrentImage();
         break;
-    case VK_F11:   
+        
+    case SDLK_F11:
 #ifdef HAVE_DATADOG
         keySpan.set_tag("action", "toggle_fullscreen");
 #endif
-        ToggleFullScreen(); 
+        ToggleFullScreen();
         break;
-    case VK_ESCAPE: 
+        
+    case SDLK_ESCAPE:
 #ifdef HAVE_DATADOG
         keySpan.set_tag("action", "quit");
 #endif
-        PostQuitMessage(0); 
+        // Send quit event
+        SDL_Event quit_event;
+        quit_event.type = SDL_EVENT_QUIT;
+        SDL_PushEvent(&quit_event);
         break;
-    case 'O':      
+        
+    case SDLK_O:
         if (ctrlPressed) {
 #ifdef HAVE_DATADOG
             keySpan.set_tag("action", "open_file");
@@ -240,8 +184,9 @@ static void OnKeyDown(WPARAM wParam) {
             OpenFileAction();
         }
         break;
-    case 'S':      
-        if (ctrlPressed && (GetKeyState(VK_SHIFT) & 0x8000)) {
+        
+    case SDLK_S:
+        if (ctrlPressed && shiftPressed) {
 #ifdef HAVE_DATADOG
             keySpan.set_tag("action", "save_as");
 #endif
@@ -253,7 +198,8 @@ static void OnKeyDown(WPARAM wParam) {
             SaveImage();
         }
         break;
-    case 'C':      
+        
+    case SDLK_C:
         if (ctrlPressed) {
 #ifdef HAVE_DATADOG
             keySpan.set_tag("action", "copy");
@@ -261,7 +207,8 @@ static void OnKeyDown(WPARAM wParam) {
             HandleCopy();
         }
         break;
-    case 'V':      
+        
+    case SDLK_V:
         if (ctrlPressed) {
 #ifdef HAVE_DATADOG
             keySpan.set_tag("action", "paste");
@@ -269,7 +216,8 @@ static void OnKeyDown(WPARAM wParam) {
             HandlePaste();
         }
         break;
-    case '0':      
+        
+    case SDLK_0:
         if (ctrlPressed) {
 #ifdef HAVE_DATADOG
             keySpan.set_tag("action", "center_image");
@@ -277,7 +225,9 @@ static void OnKeyDown(WPARAM wParam) {
             CenterImage(true);
         }
         break;
-    case VK_OEM_PLUS:  
+        
+    case SDLK_PLUS:
+    case SDLK_EQUALS:
         if (ctrlPressed) {
 #ifdef HAVE_DATADOG
             keySpan.set_tag("action", "zoom_in");
@@ -285,7 +235,8 @@ static void OnKeyDown(WPARAM wParam) {
             ZoomImage(1.25f);
         }
         break;
-    case VK_OEM_MINUS: 
+        
+    case SDLK_MINUS:
         if (ctrlPressed) {
 #ifdef HAVE_DATADOG
             keySpan.set_tag("action", "zoom_out");
@@ -296,206 +247,193 @@ static void OnKeyDown(WPARAM wParam) {
     }
 }
 
-
-static void OnContextMenu(HWND hWnd, POINT pt) {
-    HMENU hMenu = CreatePopupMenu();
-    AppendMenuW(hMenu, MF_STRING, IDM_OPEN, L"Open Image\tCtrl+O");
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, IDM_COPY, L"Copy\tCtrl+C");
-    AppendMenuW(hMenu, MF_STRING, IDM_PASTE, L"Paste\tCtrl+V");
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, IDM_NEXT_IMG, L"Next Image\tRight Arrow");
-    AppendMenuW(hMenu, MF_STRING, IDM_PREV_IMG, L"Previous Image\tLeft Arrow");
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, IDM_ROTATE_CW, L"Rotate Clockwise\tUp Arrow");
-    AppendMenuW(hMenu, MF_STRING, IDM_ROTATE_CCW, L"Rotate Counter-Clockwise\tDown Arrow");
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, IDM_ZOOM_IN, L"Zoom In\tCtrl++");
-    AppendMenuW(hMenu, MF_STRING, IDM_ZOOM_OUT, L"Zoom Out\tCtrl+-");
-    AppendMenuW(hMenu, MF_STRING, IDM_FIT_TO_WINDOW, L"Fit to Window\tCtrl+0");
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, IDM_SAVE, L"Save\tCtrl+S");
-    AppendMenuW(hMenu, MF_STRING, IDM_SAVE_AS, L"Save As\tCtrl+Shift+S");
-
-    UINT locationFlags = (g_ctx.currentImageIndex != -1) ? MF_STRING : MF_STRING | MF_GRAYED;
-    AppendMenuW(hMenu, locationFlags, IDM_OPEN_LOCATION, L"Open File Location");
-
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING | (g_ctx.showFilePath ? MF_CHECKED : MF_UNCHECKED), IDM_SHOW_FILE_PATH, L"Show File Path");
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, IDM_FULLSCREEN, L"Full Screen\tF11");
-    AppendMenuW(hMenu, MF_STRING, IDM_DELETE_IMG, L"Delete Image\tDelete");
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(hMenu, MF_STRING, IDM_EXIT, L"Exit\tEsc");
-
-    int cmd = TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hWnd, nullptr);
-    DestroyMenu(hMenu);
-
-    switch (cmd) {
-    case IDM_OPEN:          OpenFileAction(); break;
-    case IDM_COPY:          HandleCopy(); break;
-    case IDM_PASTE:         HandlePaste(); break;
-    case IDM_NEXT_IMG:      OnKeyDown(VK_RIGHT); break;
-    case IDM_PREV_IMG:      OnKeyDown(VK_LEFT); break;
-    case IDM_ZOOM_IN:       ZoomImage(1.25f); break;
-    case IDM_ZOOM_OUT:      ZoomImage(0.8f); break;
-    case IDM_FIT_TO_WINDOW: FitImageToWindow(); break;
-    case IDM_FULLSCREEN:    ToggleFullScreen(); break;
-    case IDM_DELETE_IMG:    DeleteCurrentImage(); break;
-    case IDM_EXIT:          PostQuitMessage(0); break;
-    case IDM_ROTATE_CW:     RotateImage(true); break;
-    case IDM_ROTATE_CCW:    RotateImage(false); break;
-    case IDM_SAVE:          SaveImage(); break;
-    case IDM_SAVE_AS:       SaveImageAs(); break;
-    case IDM_OPEN_LOCATION: OpenFileLocationAction(); break;
-    case IDM_SHOW_FILE_PATH:
-        g_ctx.showFilePath = !g_ctx.showFilePath;
-        InvalidateRect(hWnd, nullptr, FALSE);
-        break;
+void HandleMouseEvent(const SDL_MouseButtonEvent& event) {
+    if (event.button == SDL_BUTTON_LEFT && event.down) {
+        // Check if clicking on close button (if we want to keep that functionality)
+        SDL_Rect closeRect = GetCloseButtonRect();
+        if (event.x >= closeRect.x && event.x < closeRect.x + closeRect.w &&
+            event.y >= closeRect.y && event.y < closeRect.y + closeRect.h) {
+            // Send quit event
+            SDL_Event quit_event;
+            quit_event.type = SDL_EVENT_QUIT;
+            SDL_PushEvent(&quit_event);
+            return;
+        }
+        
+        // Check if clicking on image for dragging
+        if (g_ctx.imageData.isValid() && IsPointInImage(event.x, event.y)) {
+            // Start image dragging - this would need to be implemented
+            // For now, just do nothing
+        }
+    }
+    
+    if (event.button == SDL_BUTTON_RIGHT && event.down) {
+        ShowContextMenu(event.x, event.y);
+    }
+    
+    if (event.button == SDL_BUTTON_LEFT && event.down && event.clicks == 2) {
+        // Double-click to fit image
+        FitImageToWindow();
     }
 }
 
-LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
-    static bool isDraggingImage = false;
-    static POINT dragStart{};
-
-    switch (message) {
-    case WM_PAINT:
-        OnPaint(hWnd);
-        break;
-    case WM_KEYDOWN:
-        OnKeyDown(wParam);
-        break;
-    case WM_MOUSEWHEEL:
-        ZoomImage(GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? 1.1f : 0.9f);
-        break;
-    case WM_LBUTTONDBLCLK:
-        FitImageToWindow();
-        break;
-    case WM_RBUTTONUP: {
-        POINT pt = { LOWORD(lParam), HIWORD(lParam) };
-        ClientToScreen(hWnd, &pt);
-        OnContextMenu(hWnd, pt);
-        break;
+void HandleMouseMotion(const SDL_MouseMotionEvent& event) {
+    // Check if hovering over close button
+    SDL_Rect closeRect = GetCloseButtonRect();
+    bool isHoveringNow = (event.x >= closeRect.x && event.x < closeRect.x + closeRect.w &&
+                          event.y >= closeRect.y && event.y < closeRect.y + closeRect.h);
+    
+    if (isHoveringNow != g_ctx.isHoveringClose) {
+        g_ctx.isHoveringClose = isHoveringNow;
+        // In SDL3, we would trigger a redraw here
     }
-    case WM_DROPFILES:
-        HandleDropFiles(reinterpret_cast<HDROP>(wParam));
-        break;
-    case WM_LBUTTONDOWN: {
-        POINT pt = { LOWORD(lParam), HIWORD(lParam) };
-        RECT closeRect = GetCloseButtonRect();
-        if (PtInRect(&closeRect, pt)) {
-            PostQuitMessage(0);
-            return 0;
+    
+    // Handle image dragging if mouse is down
+    static bool isDragging = false;
+    static int dragStartX = 0, dragStartY = 0;
+    
+    if (event.state & SDL_BUTTON_LMASK) {
+        if (!isDragging && g_ctx.imageData.isValid() && IsPointInImage(event.x, event.y)) {
+            isDragging = true;
+            dragStartX = event.x;
+            dragStartY = event.y;
         }
-        if (g_ctx.imageData.isValid() && IsPointInImage(pt, {})) {
-            isDraggingImage = true;
-            dragStart = pt;
-            SetCapture(hWnd);
-        }
-        else if (!g_ctx.isFullScreen) {
-            ReleaseCapture();
-            SendMessage(hWnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
-        }
-        break;
-    }
-    case WM_LBUTTONUP:
-        if (isDraggingImage) {
-            isDraggingImage = false;
-            ReleaseCapture();
-        }
-        break;
-    case WM_MOUSEMOVE: {
-        POINT pt = { LOWORD(lParam), HIWORD(lParam) };
-        RECT closeRect = GetCloseButtonRect();
-        bool isHoveringNow = PtInRect(&closeRect, pt);
-        if (isHoveringNow != g_ctx.isHoveringClose) {
-            g_ctx.isHoveringClose = isHoveringNow;
-            InvalidateRect(hWnd, &closeRect, FALSE);
-            SendMessage(hWnd, WM_SETCURSOR, reinterpret_cast<WPARAM>(hWnd), MAKELPARAM(HTCLIENT, 0));
-        }
-        if (isDraggingImage) {
-            // Safety check to prevent division by zero or invalid zoom factor
-            if (g_ctx.zoomFactor > 0.0f && std::isfinite(g_ctx.zoomFactor)) {
-                // NASA Standard: Calculate offset changes with bounds checking
-                float deltaX = static_cast<float>(pt.x - dragStart.x);
-                float deltaY = static_cast<float>(pt.y - dragStart.y);
+        
+        if (isDragging && g_ctx.zoomFactor > 0.0f && std::isfinite(g_ctx.zoomFactor)) {
+            float deltaX = static_cast<float>(event.x - dragStartX);
+            float deltaY = static_cast<float>(event.y - dragStartY);
+            
+            float safeDivisor = std::max(g_ctx.zoomFactor, 0.01f);
+            float offsetDeltaX = deltaX / safeDivisor;
+            float offsetDeltaY = deltaY / safeDivisor;
+            
+            if (std::isfinite(offsetDeltaX) && std::isfinite(offsetDeltaY)) {
+                constexpr float kMaxOffsetDelta = 10000.0f;
+                offsetDeltaX = std::clamp(offsetDeltaX, -kMaxOffsetDelta, kMaxOffsetDelta);
+                offsetDeltaY = std::clamp(offsetDeltaY, -kMaxOffsetDelta, kMaxOffsetDelta);
                 
-                // NASA Standard: Prevent division by very small zoom factors
-                float safeDivisor = std::max(g_ctx.zoomFactor, 0.01f);
+                float newOffsetX = g_ctx.offsetX + offsetDeltaX;
+                float newOffsetY = g_ctx.offsetY + offsetDeltaY;
                 
-                float offsetDeltaX = deltaX / safeDivisor;
-                float offsetDeltaY = deltaY / safeDivisor;
-                
-                // NASA Standard: Validate offset deltas are finite
-                if (std::isfinite(offsetDeltaX) && std::isfinite(offsetDeltaY)) {
-                    // NASA Standard: Bound offset changes to prevent extreme values
-                    constexpr float kMaxOffsetDelta = 10000.0f;
-                    offsetDeltaX = std::clamp(offsetDeltaX, -kMaxOffsetDelta, kMaxOffsetDelta);
-                    offsetDeltaY = std::clamp(offsetDeltaY, -kMaxOffsetDelta, kMaxOffsetDelta);
+                constexpr float kMaxAbsoluteOffset = 1000000.0f;
+                if (std::isfinite(newOffsetX) && std::isfinite(newOffsetY) &&
+                    std::abs(newOffsetX) < kMaxAbsoluteOffset && 
+                    std::abs(newOffsetY) < kMaxAbsoluteOffset) {
                     
-                    float newOffsetX = g_ctx.offsetX + offsetDeltaX;
-                    float newOffsetY = g_ctx.offsetY + offsetDeltaY;
+                    g_ctx.offsetX = newOffsetX;
+                    g_ctx.offsetY = newOffsetY;
+                    dragStartX = event.x;
+                    dragStartY = event.y;
                     
-                    // NASA Standard: Bound absolute offset values to prevent integer overflow in renderer
-                    constexpr float kMaxAbsoluteOffset = 1000000.0f;
-                    if (std::isfinite(newOffsetX) && std::isfinite(newOffsetY) &&
-                        std::abs(newOffsetX) < kMaxAbsoluteOffset && 
-                        std::abs(newOffsetY) < kMaxAbsoluteOffset) {
-                        
-                        g_ctx.offsetX = newOffsetX;
-                        g_ctx.offsetY = newOffsetY;
-                        dragStart = pt;
-                        InvalidateRect(hWnd, nullptr, FALSE);
-                        
-                        // Log critical state for crash analysis if values are getting extreme
-                        if (std::abs(newOffsetX) > 100000.0f || std::abs(newOffsetY) > 100000.0f) {
-                            Logger::LogCriticalState(g_ctx.zoomFactor, g_ctx.offsetX, g_ctx.offsetY, "mouse_drag_extreme_offset");
-                        }
-                    } else {
-                        // Offset would be too large - stop dragging to prevent crash
-                        Logger::LogCriticalState(g_ctx.zoomFactor, newOffsetX, newOffsetY, "mouse_drag_prevented_crash");
-                        isDraggingImage = false;
-                        ReleaseCapture();
+                    // Log extreme values for debugging
+                    if (std::abs(newOffsetX) > 100000.0f || std::abs(newOffsetY) > 100000.0f) {
+                        Logger::LogCriticalState(g_ctx.zoomFactor, g_ctx.offsetX, g_ctx.offsetY, "mouse_drag_extreme_offset");
                     }
                 } else {
-                    // Non-finite offset deltas - stop dragging
-                    isDraggingImage = false;
-                    ReleaseCapture();
+                    Logger::LogCriticalState(g_ctx.zoomFactor, newOffsetX, newOffsetY, "mouse_drag_prevented_crash");
+                    isDragging = false;
                 }
             } else {
-                // Reset zoom factor to safe value and stop dragging
-                g_ctx.zoomFactor = 1.0f;
-                isDraggingImage = false;
-                ReleaseCapture();
+                isDragging = false;
             }
         }
-        break;
+    } else {
+        isDragging = false;
     }
-    case WM_SETCURSOR: {
-        if (LOWORD(lParam) == HTCLIENT && g_ctx.isHoveringClose) {
-            SetCursor(LoadCursor(nullptr, IDC_HAND));
-            return TRUE;
+}
+
+void HandleMouseWheel(const SDL_MouseWheelEvent& event) {
+    float zoomFactor = (event.y > 0) ? 1.1f : 0.9f;
+    ZoomImage(zoomFactor);
+}
+
+void ShowContextMenu(int x, int y) {
+    // For now, implement a simple menu using message boxes or print to console
+    // A full implementation would need a proper context menu system
+    
+    Logger::Info("Context menu requested at (%d, %d)", x, y);
+    
+    // For demonstration, let's show a simple message with options
+    // In a real implementation, you'd want to use a native context menu or implement a custom one
+    
+#ifdef _WIN32
+    // Use Windows context menu
+    HMENU hMenu = CreatePopupMenu();
+    AppendMenuW(hMenu, MF_STRING, 1, L"Open Image\tCtrl+O");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hMenu, MF_STRING, 2, L"Copy\tCtrl+C");
+    AppendMenuW(hMenu, MF_STRING, 3, L"Paste\tCtrl+V");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hMenu, MF_STRING, 4, L"Next Image\tRight Arrow");
+    AppendMenuW(hMenu, MF_STRING, 5, L"Previous Image\tLeft Arrow");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hMenu, MF_STRING, 6, L"Rotate Clockwise\tUp Arrow");
+    AppendMenuW(hMenu, MF_STRING, 7, L"Rotate Counter-Clockwise\tDown Arrow");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hMenu, MF_STRING, 8, L"Zoom In\tCtrl++");
+    AppendMenuW(hMenu, MF_STRING, 9, L"Zoom Out\tCtrl+-");
+    AppendMenuW(hMenu, MF_STRING, 10, L"Fit to Window\tCtrl+0");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hMenu, MF_STRING, 11, L"Save\tCtrl+S");
+    AppendMenuW(hMenu, MF_STRING, 12, L"Save As\tCtrl+Shift+S");
+    AppendMenuW(hMenu, MF_STRING, 13, L"Delete Image\tDelete");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(hMenu, MF_STRING, 14, L"Full Screen\tF11");
+    AppendMenuW(hMenu, MF_STRING, 15, L"Exit\tEsc");
+
+    // Get the native window handle from SDL
+    SDL_PropertiesID props = SDL_GetWindowProperties(g_ctx.window);
+    HWND hwnd = (HWND)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+    
+    // Convert SDL coordinates to screen coordinates
+    POINT pt = {x, y};
+    ClientToScreen(hwnd, &pt);
+
+    int cmd = TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, nullptr);
+    DestroyMenu(hMenu);
+
+    // Handle menu selection
+    switch (cmd) {
+    case 1: OpenFileAction(); break;
+    case 2: HandleCopy(); break;
+    case 3: HandlePaste(); break;
+    case 4: 
+        if (!g_ctx.imageFiles.empty()) {
+            g_ctx.currentImageIndex = (g_ctx.currentImageIndex + 1) % g_ctx.imageFiles.size();
+            LoadImageFromFile(g_ctx.imageFiles[g_ctx.currentImageIndex].c_str());
         }
-        return DefWindowProc(hWnd, message, wParam, lParam);
-    }
-    case WM_COPYDATA: {
-        PCOPYDATASTRUCT pcds = reinterpret_cast<PCOPYDATASTRUCT>(lParam);
-        if (pcds && pcds->dwData == 1) {
-            LoadImageFromFile(static_cast<wchar_t*>(pcds->lpData));
-            GetImagesInDirectory(static_cast<wchar_t*>(pcds->lpData));
+        break;
+    case 5:
+        if (!g_ctx.imageFiles.empty()) {
+            g_ctx.currentImageIndex = (g_ctx.currentImageIndex - 1 + g_ctx.imageFiles.size()) % g_ctx.imageFiles.size();
+            LoadImageFromFile(g_ctx.imageFiles[g_ctx.currentImageIndex].c_str());
         }
-        return TRUE;
-    }
-    case WM_SIZE:
-        FitImageToWindow();
-        InvalidateRect(hWnd, nullptr, FALSE);
         break;
-    case WM_DESTROY:
-        PostQuitMessage(0);
+    case 6: RotateImage(true); break;
+    case 7: RotateImage(false); break;
+    case 8: ZoomImage(1.25f); break;
+    case 9: ZoomImage(0.8f); break;
+    case 10: CenterImage(true); break;
+    case 11: SaveImage(); break;
+    case 12: SaveImageAs(); break;
+    case 13: DeleteCurrentImage(); break;
+    case 14: ToggleFullScreen(); break;
+    case 15: {
+        SDL_Event quit_event;
+        quit_event.type = SDL_EVENT_QUIT;
+        SDL_PushEvent(&quit_event);
         break;
-    default:
-        return DefWindowProc(hWnd, message, wParam, lParam);
     }
-    return 0;
+    }
+#else
+    // For other platforms, show a simple message box with common options
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Context Menu", 
+                            "Right-click context menu - use keyboard shortcuts instead:\n"
+                            "Ctrl+O: Open File\n"
+                            "Arrow Keys: Navigate/Rotate\n"
+                            "Ctrl+0: Fit to Window\n"
+                            "F11: Fullscreen\n"
+                            "Esc: Exit", 
+                            g_ctx.window);
+#endif
 }
