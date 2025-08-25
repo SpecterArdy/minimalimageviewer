@@ -11,6 +11,7 @@ include(cmake/CPM.cmake)
 # ── Build-mode options and ccache ────────────────────────────────────────────
 # Toggle portable distribution features (static CRTs + DLL bundling).
 option(PORTABLE_STANDALONE "Bundle runtime DLLs and link static CRTs for portable builds" OFF)
+option(BUNDLE_DEPENDENCIES "Bundle runtime DLLs for standalone execution (all build types)" ON)
 # In Debug, default to fast local builds unless the user explicitly enables portability
 if (CMAKE_BUILD_TYPE MATCHES "Debug" AND NOT DEFINED PORTABLE_STANDALONE)
     set(PORTABLE_STANDALONE OFF CACHE BOOL "" FORCE)
@@ -300,17 +301,27 @@ if (WIN32)
                 )
             endif()
 
-            # Bundle dependent DLLs only for portable Release-type builds
-            if (CMAKE_BUILD_TYPE MATCHES "Release|RelWithDebInfo")
-                file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-                add_custom_command(TARGET minimalimageviewer POST_BUILD
-                        COMMAND "${CMAKE_COMMAND}"
-                            -DEXECUTABLE="$<TARGET_FILE:minimalimageviewer>"
-                            -DSEARCH_DIRS="${MSYS2_UCRT64_PREFIX}/bin;${MSYS2_UCRT64_PREFIX}/lib"
-                            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/BundleDeps.cmake"
-                        COMMENT "Bundling runtime DLLs (OCIO/OIIO and dependencies) next to the executable"
-                )
-            endif()
+# Bundle dependent DLLs for all build types when targeting portable builds
+            file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+            add_custom_command(TARGET minimalimageviewer POST_BUILD
+                    COMMAND "${CMAKE_COMMAND}"
+                        -DEXECUTABLE="$<TARGET_FILE:minimalimageviewer>"
+                        -DSEARCH_DIRS="${MSYS2_UCRT64_PREFIX}/bin;${MSYS2_UCRT64_PREFIX}/lib"
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/BundleDeps.cmake"
+                    COMMENT "Bundling runtime DLLs (SDL3, OCIO/OIIO and dependencies) next to the executable"
+            )
+        endif()
+        
+        # Also bundle dependencies when BUNDLE_DEPENDENCIES is enabled (even for non-portable builds)
+        if (BUNDLE_DEPENDENCIES AND NOT PORTABLE_STANDALONE)
+            file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+            add_custom_command(TARGET minimalimageviewer POST_BUILD
+                    COMMAND "${CMAKE_COMMAND}"
+                        -DEXECUTABLE="$<TARGET_FILE:minimalimageviewer>"
+                        -DSEARCH_DIRS="${MSYS2_UCRT64_PREFIX}/bin;${MSYS2_UCRT64_PREFIX}/lib"
+                        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/BundleDeps.cmake"
+                    COMMENT "Bundling runtime DLLs (SDL3, OCIO/OIIO and dependencies) for standalone execution"
+            )
         endif()
     endif()
 endif()
@@ -320,9 +331,4 @@ if (MSVC)
     target_compile_options(minimalimageviewer PRIVATE -Wconversion -Wshadow)
 else()
     target_compile_options(minimalimageviewer PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
-endif()
-
-# MSVC runtime (if you ever switch to MSVC toolchain)
-if (MSVC)
-    set_property(TARGET minimalimageviewer PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
